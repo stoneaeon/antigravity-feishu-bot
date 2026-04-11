@@ -44,7 +44,13 @@ feishu.py send_result   ← 结果发回飞书
 
 ## 飞书开放平台配置（one-time，与机器无关）
 
-在 [open.feishu.cn/app](https://open.feishu.cn/app) 完成以下步骤。**此配置只需做一次，与使用哪台电脑无关。**
+在飞书开放平台完成以下步骤。**此配置只需做一次，与使用哪台电脑无关。**
+
+> 💡 **快速创建入口（强烈推荐）**：你可以直接点击此链接快速创建飞书机器人，省去大部分繁琐配置：
+> [https://open.feishu.cn/page/openclaw?form=multiAgent](https://open.feishu.cn/page/openclaw?form=multiAgent)
+> 创建好应用后，只需去后台复制出 `App ID` 和 `App Secret`，然后确认开启「长连接」事件即可。
+
+如果你选择手动从零开始配置：
 
 ### 第 1 步：创建应用
 
@@ -91,7 +97,7 @@ feishu.py send_result   ← 结果发回飞书
 ### 第 1 步：克隆到 Antigravity 插件目录
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/antigravity-feishu-bot.git \
+git clone https://github.com/stoneaeon/antigravity-feishu-bot.git \
   ~/Antigravity/AFPlugin/feishu-bot
 ```
 
@@ -125,7 +131,7 @@ source ~/.zshrc
 验证：
 ```bash
 echo $FEISHU_PLUGIN_PATH
-# 应输出：/Users/你的用户名/Antigravity/AFPlugin/feishu-bot
+# 应输出包含你的实际完整路径，如：/Users/xxx/Antigravity/AFPlugin/feishu-bot
 ```
 
 ### 第 4 步：重启 Antigravity
@@ -137,6 +143,8 @@ echo $FEISHU_PLUGIN_PATH
 ---
 
 安装完成。接下来为每个项目执行一次绑定。
+
+> 💡 **专家提示**：既然你已经在使用 Antigravity，如果安装或后续使用中碰到任何问题、报错，请**直接把问题抛给 Antigravity**！作为本项目的原生定制环境，Agent 可以瞬间帮你分析日志和排查故障，完全不用自己动手！
 
 ---
 
@@ -362,7 +370,13 @@ A：重复「插件安装」章节的第 1-4 步（约 2 分钟）。飞书 App 
 如果这个基于大模型的全自动飞书联动小插件，为你切切实实省下了开发或者摸鱼的时间，欢迎请作者喝杯咖啡！你的支持是我持续维护和优化扩展的最大动力。
 
 <div align="center">
-  <img src="https://github.com/user-attachments/assets/1fb9b892-f993-49c5-8821-dfc920070180" width="250px" alt="微信赞赏码" style="margin-right: 20px;">
-  <img src="https://github.com/user-attachments/assets/784dc0c0-3413-4eff-8a71-19e8bd8880b1" width="250px" alt="支付宝收款码">
+  <div style="display: inline-block; margin-right: 20px; text-align: center;">
+    <img src="https://github.com/user-attachments/assets/1fb9b892-f993-49c5-8821-dfc920070180" width="250px" alt="微信赞赏码"><br>
+    <b>Wechat Pay</b>
+  </div>
+  <div style="display: inline-block; text-align: center;">
+    <img src="https://github.com/user-attachments/assets/784dc0c0-3413-4eff-8a71-19e8bd8880b1" width="250px" alt="支付宝收款码"><br>
+    <b>Alipay</b>
+  </div>
 </div>
 
