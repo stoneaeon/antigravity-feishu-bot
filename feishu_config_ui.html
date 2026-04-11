@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>飞书机器人配置 · Antigravity 插件</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    /* ─── 全局变量 ─────────────────────────────────────────── */
+    :root {
+      --bg:           #0d0f14;
+      --bg-card:      #151820;
+      --bg-input:     #1c1f2a;
+      --bg-hover:     #202435;
+      --border:       rgba(255,255,255,0.07);
+      --border-focus: rgba(90,130,255,0.6);
+      --accent:       #5a82ff;
+      --accent-glow:  rgba(90,130,255,0.25);
+      --accent-2:     #a259ff;
+      --green:        #3ecf8e;
+      --green-glow:   rgba(62,207,142,0.2);
+      --red:          #ff5f5f;
+      --orange:       #ffaa45;
+      --text-1:       #f0f2ff;
+      --text-2:       #8890b0;
+      --text-3:       #555c78;
+      --radius:       12px;
+      --radius-sm:    8px;
+      --shadow:       0 24px 64px rgba(0,0,0,0.5);
+    }
+
+    /* ─── Reset ────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text-1);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px 80px;
+      background-image:
+        radial-gradient(ellipse 60% 40% at 20% 0%, rgba(90,130,255,0.08) 0%, transparent 60%),
+        radial-gradient(ellipse 50% 30% at 80% 100%, rgba(162,89,255,0.06) 0%, transparent 60%);
+    }
+
+    /* ─── Header ────────────────────────────────────────────── */
+    .header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .logo-icon {
+      width: 48px; height: 48px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-radius: 12px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 24px;
+      box-shadow: 0 0 30px var(--accent-glow);
+    }
+
+    .logo-text { font-size: 22px; font-weight: 700; }
+    .logo-sub  { font-size: 13px; color: var(--text-2); margin-top: 4px; }
+
+    h1 {
+      font-size: 32px;
+      font-weight: 700;
+      background: linear-gradient(135deg, var(--text-1) 40%, var(--accent));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 8px;
+    }
+
+    .subtitle { color: var(--text-2); font-size: 15px; }
+
+    /* ─── Layout ────────────────────────────────────────────── */
+    .container {
+      width: 100%; max-width: 700px;
+      display: flex; flex-direction: column; gap: 20px;
+    }
+
+    /* ─── Step Badges ──────────────────────────────────────── */
+    .steps {
+      display: flex; gap: 8px; flex-wrap: wrap;
+      justify-content: center; margin-bottom: 8px;
+    }
+
+    .step {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      font-size: 12px; color: var(--text-2);
+      transition: all 0.2s;
+      cursor: default;
+    }
+
+    .step.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-glow);
+    }
+
+    .step.done { border-color: var(--green); color: var(--green); background: var(--green-glow); }
+    .step-num  { font-weight: 700; font-size: 11px; }
+
+    /* ─── Cards ─────────────────────────────────────────────── */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.3s;
+    }
+
+    .card::before {
+      content: '';
+      position: absolute; inset: 0;
+      background: linear-gradient(135deg, rgba(90,130,255,0.03) 0%, transparent 60%);
+      pointer-events: none;
+    }
+
+    .card:hover { border-color: rgba(255,255,255,0.12); }
+
+    .card-header {
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .card-icon {
+      width: 38px; height: 38px;
+      background: var(--bg-input);
+      border-radius: var(--radius-sm);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+      flex-shrink: 0;
+    }
+
+    .card-title  { font-size: 15px; font-weight: 600; }
+    .card-desc   { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+
+    /* ─── Form Elements ─────────────────────────────────────── */
+    .field { margin-bottom: 18px; }
+    .field:last-child { margin-bottom: 0; }
+
+    label {
+      display: block;
+      font-size: 12px; font-weight: 500;
+      color: var(--text-2);
+      margin-bottom: 6px;
+      text-transform: uppercase; letter-spacing: 0.5px;
+    }
+
+    .required::after { content: ' *'; color: var(--accent); }
+
+    input[type="text"],
+    input[type="password"],
+    input[type="url"] {
+      width: 100%;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-1);
+      font-family: inherit; font-size: 14px;
+      padding: 11px 14px;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    input:focus {
+      border-color: var(--border-focus);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    input::placeholder { color: var(--text-3); }
+
+    .input-hint {
+      font-size: 11px; color: var(--text-3);
+      margin-top: 5px; line-height: 1.5;
+    }
+
+    .input-hint a { color: var(--accent); text-decoration: none; }
+    .input-hint a:hover { text-decoration: underline; }
+
+    /* ─── Toggle Switch ─────────────────────────────────────── */
+    .toggle-row {
+      display: flex; align-items: center;
+      justify-content: space-between;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .toggle-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .toggle-row:first-child { padding-top: 0; }
+
+    .toggle-label { font-size: 13px; font-weight: 500; }
+    .toggle-desc  { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+    .toggle {
+      position: relative; width: 44px; height: 24px;
+      flex-shrink: 0; cursor: pointer;
+    }
+
+    .toggle input { opacity: 0; width: 0; height: 0; }
+
+    .toggle-track {
+      position: absolute; inset: 0;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      transition: all 0.25s;
+    }
+
+    .toggle-track::after {
+      content: '';
+      position: absolute;
+      left: 3px; top: 50%; transform: translateY(-50%);
+      width: 18px; height: 18px;
+      background: var(--text-3);
+      border-radius: 50%;
+      transition: all 0.25s;
+    }
+
+    .toggle input:checked + .toggle-track {
+      background: var(--accent);
+      border-color: var(--accent);
+      box-shadow: 0 0 12px var(--accent-glow);
+    }
+
+    .toggle input:checked + .toggle-track::after {
+      left: calc(100% - 21px);
+      background: white;
+    }
+
+    /* ─── Buttons ────────────────────────────────────────────── */
+    .btn-row {
+      display: flex; gap: 10px; flex-wrap: wrap;
+      margin-top: 4px;
+    }
+
+    button {
+      font-family: inherit; font-size: 13px; font-weight: 500;
+      padding: 10px 20px;
+      border-radius: var(--radius-sm);
+      border: none; cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+      box-shadow: 0 4px 16px var(--accent-glow);
+    }
+
+    .btn-primary:hover { background: #6b93ff; transform: translateY(-1px); }
+    .btn-primary:active { transform: translateY(0); }
+
+    .btn-secondary {
+      background: var(--bg-input);
+      color: var(--text-1);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover { background: var(--bg-hover); border-color: rgba(255,255,255,0.15); }
+
+    .btn-danger {
+      background: rgba(255,95,95,0.15);
+      color: var(--red);
+      border: 1px solid rgba(255,95,95,0.2);
+    }
+
+    .btn-danger:hover { background: rgba(255,95,95,0.25); }
+
+    .btn-success {
+      background: var(--green-glow);
+      color: var(--green);
+      border: 1px solid rgba(62,207,142,0.3);
+    }
+
+    .btn-success:hover { background: rgba(62,207,142,0.25); }
+
+    button:disabled {
+      opacity: 0.4; cursor: not-allowed; transform: none !important;
+    }
+
+    /* ─── Chat List ─────────────────────────────────────────── */
+    .chat-list {
+      margin-top: 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      display: none;
+    }
+
+    .chat-list.show { display: block; }
+
+    .chat-item {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 16px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+
+    .chat-item:last-child { border-bottom: none; }
+    .chat-item:hover { background: var(--bg-hover); }
+
+    .chat-item.selected { background: var(--accent-glow); }
+
+    .chat-avatar {
+      width: 34px; height: 34px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px; flex-shrink: 0;
+    }
+
+    .chat-name { font-size: 13px; font-weight: 500; }
+    .chat-id   { font-size: 11px; color: var(--text-3); margin-top: 1px; font-family: monospace; }
+
+    /* ─── Status Badge ──────────────────────────────────────── */
+    .status-bar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+    }
+
+    .status-bar.success { background: var(--green-glow); color: var(--green); border: 1px solid rgba(62,207,142,0.25); }
+    .status-bar.error   { background: rgba(255,95,95,0.12); color: var(--red); border: 1px solid rgba(255,95,95,0.25); }
+    .status-bar.info    { background: var(--accent-glow); color: var(--accent); border: 1px solid rgba(90,130,255,0.25); }
+    .status-bar.warning { background: rgba(255,170,69,0.12); color: var(--orange); border: 1px solid rgba(255,170,69,0.25); }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%; flex-shrink: 0;
+    }
+
+    .status-bar.success .status-dot { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+    .status-bar.error   .status-dot { background: var(--red); }
+    .status-bar.info    .status-dot { background: var(--accent); }
+    .status-bar.warning .status-dot { background: var(--orange); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* ─── Code Block ─────────────────────────────────────────── */
+    .code-block {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 14px 16px;
+      font-family: 'Menlo', 'Monaco', 'Consolas', monospace;
+      font-size: 12px; color: var(--text-2);
+      line-height: 1.7;
+      white-space: pre-wrap; word-break: break-all;
+      position: relative;
+    }
+
+    .copy-btn {
+      position: absolute; top: 8px; right: 8px;
+      padding: 4px 10px; font-size: 11px;
+    }
+
+    /* ─── Guide Steps ─────────────────────────────────────────── */
+    .guide-step {
+      display: flex; gap: 14px; align-items: flex-start;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .guide-step:last-child { border-bottom: none; }
+
+    .guide-num {
+      width: 26px; height: 26px;
+      background: var(--accent-glow);
+      border: 1px solid var(--accent);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; color: var(--accent);
+      flex-shrink: 0; margin-top: 1px;
+    }
+
+    .guide-content { flex: 1; }
+    .guide-title   { font-size: 13px; font-weight: 500; margin-bottom: 3px; }
+    .guide-detail  { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+    .guide-detail a { color: var(--accent); text-decoration: none; }
+    .guide-detail a:hover { text-decoration: underline; }
+
+    /* ─── Divider ─────────────────────────────────────────────── */
+    .divider {
+      height: 1px; background: var(--border);
+      margin: 20px 0;
+    }
+
+    /* ─── Loader ──────────────────────────────────────────────── */
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: currentColor;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: inline-block;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Toast ───────────────────────────────────────────────── */
+    #toast {
+      position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%) translateY(80px);
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 20px;
+      font-size: 13px;
+      box-shadow: var(--shadow);
+      transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+      z-index: 1000;
+      white-space: nowrap;
+    }
+
+    #toast.show { transform: translateX(-50%) translateY(0); }
+    #toast.success { color: var(--green); border-color: rgba(62,207,142,0.3); }
+    #toast.error   { color: var(--red);   border-color: rgba(255,95,95,0.3); }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">
+    <div class="logo-icon">🤖</div>
+    <div>
+      <div class="logo-text">飞书机器人配置</div>
+      <div class="logo-sub">Antigravity 插件 · 方案B · App Bot 完整版</div>
+    </div>
+  </div>
+  <h1>连接飞书，双向通信</h1>
+  <p class="subtitle">配置完成后，Antigravity 将自动通知飞书群，并接收群消息作为对话输入</p>
+</div>
+
+<!-- 进度步骤 -->
+<div class="steps" id="stepBadges">
+  <div class="step active" id="step1badge"><span class="step-num">1</span> 创建飞书应用</div>
+  <div class="step" id="step2badge"><span class="step-num">2</span> 填写凭证</div>
+  <div class="step" id="step3badge"><span class="step-num">3</span> 选择目标群</div>
+  <div class="step" id="step4badge"><span class="step-num">4</span> 完成配置</div>
+</div>
+
+<div class="container">
+
+  <!-- ── 卡片1: 引导步骤 ─────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">📋</div>
+      <div>
+        <div class="card-title">前置步骤：在飞书开放平台创建应用</div>
+        <div class="card-desc">只需配置一次，全项目共享</div>
+      </div>
+    </div>
+
+    <div class="guide-step">
+      <div class="guide-num">1</div>
+      <div class="guide-content">
+        <div class="guide-title">创建企业自建应用</div>
+        <div class="guide-detail">
+          访问 <a href="https://open.feishu.cn/app" target="_blank">open.feishu.cn/app</a>，
+          点击「创建企业自建应用」，填写应用名称和描述。
+        </div>
+      </div>
+    </div>
+
+    <div class="guide-step">
+      <div class="guide-num">2</div>
+      <div class="guide-content">
+        <div class="guide-title">开启机器人能力</div>
+        <div class="guide-detail">
+          应用详情页 → 「功能」→「机器人」→ 点击启用。
+        </div>
+      </div>
+    </div>
+
+    <div class="guide-step">
+      <div class="guide-num">3</div>
+      <div class="guide-content">
+        <div class="guide-title">添加权限范围</div>
+        <div class="guide-detail">
+          「权限管理」→「添加权限」→ 搜索并添加：<br/>
+          <code style="background:var(--bg-input);padding:2px 6px;border-radius:4px;font-size:11px">im:message</code>&nbsp;
+          <code style="background:var(--bg-input);padding:2px 6px;border-radius:4px;font-size:11px">im:chat:readonly</code>
+        </div>
+      </div>
+    </div>
+
+    <div class="guide-step">
+      <div class="guide-num">4</div>
+      <div class="guide-content">
+        <div class="guide-title">发布应用并邀请机器人</div>
+        <div class="guide-detail">
+          点击「版本管理与发布」→「申请发布」（或测试版直接使用）。<br/>
+          然后在目标飞书群 → 「...」→「群机器人」→「添加机器人」→ 搜索你的应用名称。
+        </div>
+      </div>
+    </div>
+
+    <div class="guide-step">
+      <div class="guide-num">5</div>
+      <div class="guide-content">
+        <div class="guide-title">获取 App ID 和 App Secret</div>
+        <div class="guide-detail">
+          应用详情页 →「凭证与基础信息」→ 复制 App ID 和 App Secret。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 卡片2: App 凭证 ────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">🔑</div>
+      <div>
+        <div class="card-title">应用凭证</div>
+        <div class="card-desc">从飞书开放平台获取，仅存储在本地</div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="required">项目名称</label>
+      <input type="text" id="projectName" placeholder="例如：我的项目" />
+      <div class="input-hint">将显示在飞书通知消息中</div>
+    </div>
+
+    <div class="field">
+      <label class="required">App ID</label>
+      <input type="text" id="appId" placeholder="cli_xxxxxxxxxxxxxxxxx" />
+    </div>
+
+    <div class="field">
+      <label class="required">App Secret</label>
+      <input type="password" id="appSecret" placeholder="••••••••••••••••••••••••" />
+      <div class="input-hint">⚠️ 凭证仅保存在本地 .antigravity/feishu_config.json 中，不会上传</div>
+    </div>
+
+    <div id="tokenStatus" style="display:none;margin-top:4px;"></div>
+
+    <div class="btn-row" style="margin-top: 16px;">
+      <button class="btn-primary" onclick="verifyToken()" id="verifyBtn">
+        <span class="spinner" id="verifySpinner" style="display:none;"></span>
+        🔍 验证凭证 &amp; 获取群列表
+      </button>
+    </div>
+  </div>
+
+  <!-- ── 卡片3: 选择群聊 ────────────────────────────────────────────────── -->
+  <div class="card" id="chatCard" style="display:none;">
+    <div class="card-header">
+      <div class="card-icon">💬</div>
+      <div>
+        <div class="card-title">选择目标群聊</div>
+        <div class="card-desc">消息将推送到此群，并从此群接收消息</div>
+      </div>
+    </div>
+
+    <div id="chatStatusMsg"></div>
+
+    <div class="chat-list show" id="chatList"></div>
+
+    <div class="field" style="margin-top:14px;">
+      <label>或手动输入 Chat ID</label>
+      <input type="text" id="chatIdManual" placeholder="oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" />
+      <div class="input-hint">在群设置中可查看，格式为 oc_ 开头</div>
+    </div>
+  </div>
+
+  <!-- ── 卡片4: 通知设置 ────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">⚙️</div>
+      <div>
+        <div class="card-title">通知与功能设置</div>
+        <div class="card-desc">自定义各功能的开关</div>
+      </div>
+    </div>
+
+    <div class="toggle-row">
+      <div>
+        <div class="toggle-label">🚀 打开项目时发送通知（功能1）</div>
+        <div class="toggle-desc">Antigravity 激活项目时，向飞书群发送就绪通知</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="notifyOnOpen" checked />
+        <div class="toggle-track"></div>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <div>
+        <div class="toggle-label">✅ 对话完成后推送结果（功能3）</div>
+        <div class="toggle-desc">每次 Agent 完成响应后，将结果摘要发送到飞书群</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="notifyOnCompletion" checked />
+        <div class="toggle-track"></div>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <div>
+        <div class="toggle-label">📨 接收飞书消息作为对话输入（功能4）</div>
+        <div class="toggle-desc">需要运行 feishu_listener.py 守护进程</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="listenIncoming" checked />
+        <div class="toggle-track"></div>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <div>
+        <div class="toggle-label">💅 使用消息卡片格式</div>
+        <div class="toggle-desc">消息卡片更美观，支持标题、Markdown 内容；否则使用纯文本</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="useCardFormat" checked />
+        <div class="toggle-track"></div>
+      </label>
+    </div>
+  </div>
+
+  <!-- ── 卡片5: 保存 & 生成命令 ─────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">💾</div>
+      <div>
+        <div class="card-title">保存配置</div>
+        <div class="card-desc">生成配置文件内容，在 Antigravity 终端中运行初始化命令</div>
+      </div>
+    </div>
+
+    <div id="saveStatus" style="display:none;margin-bottom:14px;"></div>
+
+    <div class="btn-row">
+      <button class="btn-primary" onclick="generateConfig()" id="saveBtn">
+        ✨ 生成配置命令
+      </button>
+      <button class="btn-secondary" onclick="testConnection()" id="testBtn">
+        🧪 测试连接
+      </button>
+    </div>
+
+    <div id="configOutput" style="display:none;margin-top:18px;">
+      <div class="divider"></div>
+      <label style="margin-bottom:10px;display:block;">在 Antigravity 终端中运行以下命令：</label>
+      <div class="code-block" id="configCode">
+        <button class="btn-secondary copy-btn" onclick="copyCode()">复制</button>
+        <div id="codeContent"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 卡片6: 启动监听器 ──────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-icon">📡</div>
+      <div>
+        <div class="card-title">启动消息监听器（功能4）</div>
+        <div class="card-desc">在 Antigravity 终端中运行，接收飞书群消息</div>
+      </div>
+    </div>
+
+    <div class="code-block" style="margin-bottom:14px;">
+      <button class="btn-secondary copy-btn" onclick="copyListenerCmd()">复制</button>
+      <div id="listenerCmd">
+# 前台运行（测试用）
+python feishu-bot/feishu_listener.py
+
+# 后台守护进程运行（推荐）
+python feishu-bot/feishu_listener.py --daemon
+
+# 查看运行状态
+python feishu-bot/feishu_listener.py --status
+
+# 停止守护进程
+python feishu-bot/feishu_listener.py --stop</div>
+    </div>
+
+    <div class="status-bar info">
+      <div class="status-dot"></div>
+      监听器启动后，将在 <code>.antigravity/feishu_messages.json</code> 中写入收到的消息
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<div id="toast"></div>
+
+<script>
+// ─── 状态 ─────────────────────────────────────────────────────────────────
+let verifiedToken  = null;
+let selectedChatId = null;
+let chatList       = [];
+
+// ─── 工具函数 ──────────────────────────────────────────────────────────────
+const $  = id => document.getElementById(id);
+const val = id => $(id)?.value?.trim() ?? '';
+
+function showToast(msg, type = 'info') {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className   = `show ${type}`;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 3200);
+}
+
+function setStatus(containerId, type, msg) {
+  const el = $(containerId);
+  el.style.display = 'block';
+  el.innerHTML = `
+    <div class="status-bar ${type}">
+      <div class="status-dot"></div>
+      ${msg}
+    </div>`;
+}
+
+function setStep(n) {
+  for (let i = 1; i <= 4; i++) {
+    const el = $(`step${i}badge`);
+    el.className = 'step' + (i < n ? ' done' : i === n ? ' active' : '');
+    if (i < n) el.innerHTML = `<span class="step-num">✓</span> ${el.textContent.replace(/^[✓\d]\s*/, '')}`;
+  }
+}
+
+// ─── 验证凭证 & 获取群列表 ─────────────────────────────────────────────────
+async function verifyToken() {
+  const appId     = val('appId');
+  const appSecret = val('appSecret');
+
+  if (!appId || !appSecret) {
+    showToast('请填写 App ID 和 App Secret', 'error');
+    return;
+  }
+
+  const btn     = $('verifyBtn');
+  const spinner = $('verifySpinner');
+  btn.disabled  = true;
+  spinner.style.display = 'inline-block';
+
+  try {
+    // 获取 access token
+    const tokenResp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({app_id: appId, app_secret: appSecret}),
+    });
+    const tokenData = await tokenResp.json();
+
+    if (tokenData.code !== 0) {
+      setStatus('tokenStatus', 'error', `凭证验证失败：${tokenData.msg}（code=${tokenData.code}）`);
+      showToast('凭证验证失败', 'error');
+      return;
+    }
+
+    verifiedToken = tokenData.tenant_access_token;
+    setStatus('tokenStatus', 'success', '✅ 凭证有效！正在获取群列表...');
+    setStep(3);
+
+    // 获取群列表
+    const chatsResp = await fetch('https://open.feishu.cn/open-apis/im/v1/chats?page_size=50', {
+      headers: {'Authorization': `Bearer ${verifiedToken}`},
+    });
+    const chatsData = await chatsResp.json();
+
+    $('chatCard').style.display = 'block';
+    $('chatCard').scrollIntoView({behavior: 'smooth', block: 'start'});
+
+    if (chatsData.code === 0) {
+      chatList = chatsData.data?.items ?? [];
+      renderChatList(chatList);
+      setStatus('tokenStatus', 'success', `✅ 凭证验证成功！找到 ${chatList.length} 个群`);
+    } else {
+      setStatus('chatStatusMsg', 'warning', `获取群列表失败（${chatsData.msg}），请手动填写 Chat ID`);
+    }
+
+  } catch (e) {
+    setStatus('tokenStatus', 'error', `网络请求失败：${e.message}`);
+    showToast('网络请求失败', 'error');
+  } finally {
+    btn.disabled = false;
+    spinner.style.display = 'none';
+  }
+}
+
+// ─── 渲染群列表 ────────────────────────────────────────────────────────────
+function renderChatList(chats) {
+  const list = $('chatList');
+  if (!chats.length) {
+    list.innerHTML = `
+      <div class="chat-item" style="cursor:default;color:var(--text-2)">
+        未找到群聊，请确认机器人已被邀请至目标群
+      </div>`;
+    return;
+  }
+
+  list.innerHTML = chats.map((c, i) => `
+    <div class="chat-item" id="chat_${i}" onclick="selectChat(${i})">
+      <div class="chat-avatar">💬</div>
+      <div>
+        <div class="chat-name">${escHtml(c.name || '未知群名')}</div>
+        <div class="chat-id">${c.chat_id}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function selectChat(idx) {
+  document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('selected'));
+  $(`chat_${idx}`)?.classList.add('selected');
+  selectedChatId = chatList[idx]?.chat_id ?? '';
+  $('chatIdManual').value = selectedChatId;
+  showToast(`已选择：${chatList[idx]?.name}`, 'success');
+}
+
+function escHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ─── 生成配置 ──────────────────────────────────────────────────────────────
+function generateConfig() {
+  const projectName  = val('projectName');
+  const appId        = val('appId');
+  const appSecret    = val('appSecret');
+  const chatId       = val('chatIdManual') || selectedChatId || '';
+
+  if (!projectName || !appId || !appSecret || !chatId) {
+    showToast('请填写所有必填项（包括选择群聊）', 'error');
+    return;
+  }
+
+  const config = {
+    enabled:             true,
+    project_name:        projectName,
+    app_id:              appId,
+    app_secret:          appSecret,
+    chat_id:             chatId,
+    notify_on_open:      $('notifyOnOpen').checked,
+    notify_on_completion: $('notifyOnCompletion').checked,
+    listen_incoming:     $('listenIncoming').checked,
+    use_card_format:     $('useCardFormat').checked,
+  };
+
+  const jsonStr = JSON.stringify(config, null, 2);
+
+  const cmds = [
+    `# 1. 创建配置目录`,
+    `mkdir -p .antigravity`,
+    ``,
+    `# 2. 写入配置文件`,
+    `cat > .antigravity/feishu_config.json << 'EOF'`,
+    jsonStr,
+    `EOF`,
+    ``,
+    `# 3. 安装依赖`,
+    `pip install -r feishu-bot/requirements.txt`,
+    ``,
+    `# 4. 测试连接`,
+    `python feishu-bot/feishu.py test`,
+  ].join('\n');
+
+  $('codeContent').textContent = cmds;
+  $('configOutput').style.display = 'block';
+  $('configOutput').scrollIntoView({behavior: 'smooth', block: 'start'});
+  setStep(4);
+  showToast('配置命令已生成！', 'success');
+}
+
+// ─── 测试连接（浏览器直接调用飞书API）─────────────────────────────────────
+async function testConnection() {
+  const chatId = val('chatIdManual') || selectedChatId;
+  if (!verifiedToken || !chatId) {
+    showToast('请先验证凭证并选择群聊', 'error');
+    return;
+  }
+
+  const btn = $('testBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> 发送中...';
+
+  try {
+    const projectName = val('projectName') || '测试项目';
+    const card = {
+      config:   {wide_screen_mode: true},
+      header:   {
+        title:    {tag: 'plain_text', content: '🧪 连接测试 · Antigravity 飞书插件'},
+        template: 'turquoise'
+      },
+      elements: [{
+        tag:  'div',
+        text: {
+          tag:     'lark_md',
+          content: `**项目**：${projectName}\n**状态**：✅ 配置界面连接测试成功！\n**时间**：${new Date().toLocaleString('zh-CN')}`
+        }
+      }]
+    };
+
+    const resp = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id`, {
+      method:  'POST',
+      headers: {
+        'Authorization': `Bearer ${verifiedToken}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({
+        receive_id: chatId,
+        msg_type:   'interactive',
+        content:    JSON.stringify(card),
+      }),
+    });
+    const data = await resp.json();
+
+    if (data.code === 0) {
+      setStatus('saveStatus', 'success', '✅ 测试消息发送成功！请查看飞书群');
+      showToast('测试成功！请查看飞书群 🎉', 'success');
+    } else {
+      setStatus('saveStatus', 'error', `发送失败：${data.msg}（code=${data.code}）`);
+      showToast('发送失败: ' + data.msg, 'error');
+    }
+  } catch(e) {
+    setStatus('saveStatus', 'error', `请求失败：${e.message}`);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '🧪 测试连接';
+    $('saveStatus').style.display = 'block';
+  }
+}
+
+// ─── 复制 ──────────────────────────────────────────────────────────────────
+function copyCode() {
+  const text = $('codeContent').textContent;
+  navigator.clipboard.writeText(text)
+    .then(() => showToast('命令已复制到剪贴板', 'success'))
+    .catch(() => showToast('复制失败，请手动选择', 'error'));
+}
+
+function copyListenerCmd() {
+  const text = $('listenerCmd').textContent;
+  navigator.clipboard.writeText(text)
+    .then(() => showToast('命令已复制', 'success'))
+    .catch(() => showToast('复制失败', 'error'));
+}
+
+// ─── 初始化：从 URL 参数读取已有配置 ───────────────────────────────────────
+(function init() {
+  const params = new URLSearchParams(location.search);
+  if (params.get('project')) $('projectName').value = params.get('project');
+  if (params.get('app_id'))  $('appId').value = params.get('app_id');
+  setStep(1);
+})();
+</script>
+
+</body>
+</html>
