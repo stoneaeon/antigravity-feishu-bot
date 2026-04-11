@@ -289,10 +289,38 @@ def send_result(summary: str, cfg: dict = None, ws: Path = None,
     return ok
 
 # ── 功能 4：读取消息队列 ─────────────────────────────────────────────────────
+def mark_processing(ws: Path = None, processing: bool = True) -> None:
+    """
+    在队列文件中设置/清除 processing 锁。
+    Agent 读取消息后应立即调用 mark_processing(processing=True)，
+    处理完成后调用 clear_messages()（自动清除锁）。
+    watcher 会检查此锁，避免在 Agent 处理期间重复触发。
+    """
+    ws = ws or find_workspace()
+    qp = queue_path(ws)
+    if not qp.exists():
+        return
+    try:
+        data = json.loads(qp.read_text(encoding="utf-8"))
+        if processing:
+            data["processing"] = True
+            data["processing_since"] = now()
+        else:
+            data.pop("processing", None)
+            data.pop("processing_since", None)
+        qp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except (json.JSONDecodeError, OSError):
+        pass
+
+
 def read_messages(ws: Path = None, clear: bool = True) -> list:
     """
     读取由 feishu_listener.py 写入的消息队列。
-    clear=True 时读取后自动清空队列。
+    clear=True 时读取后自动清空队列，并清除 processing 锁。
+    读取后、清空前会标记 processing=True，通知 watcher 不要重复触发。
     """
     ws = ws or find_workspace()
     qp = queue_path(ws)
@@ -302,11 +330,15 @@ def read_messages(ws: Path = None, clear: bool = True) -> list:
         data = json.loads(qp.read_text(encoding="utf-8"))
         msgs = data.get("messages", [])
         if clear and msgs:
+            # 标记 processing 后清空队列，watcher 看到空队列即不再触发
             qp.write_text(
                 json.dumps({"messages": [], "last_read": now()},
                            ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        elif msgs:
+            # 不清空时，标记 processing 防止 watcher 重复触发
+            mark_processing(ws, processing=True)
         return msgs
     except (json.JSONDecodeError, OSError) as e:
         _err(f"读取消息队列失败: {e}")
@@ -427,7 +459,7 @@ def main() -> None:
         "cmd", nargs="?", default="status",
         choices=["setup", "status", "test", "send_open_message",
                  "send_result", "send_text", "send_reaction", "read_messages",
-                 "clear_messages", "get_chats"],
+                 "clear_messages", "mark_processing", "get_chats"],
     )
     parser.add_argument("args", nargs="*", help="命令附加参数")
     parser.add_argument("--app-id",    dest="app_id",    default="")
@@ -530,6 +562,12 @@ def main() -> None:
     # ── clear_messages ─────────────────────────────────────────────────────
     elif args.cmd == "clear_messages":
         clear_messages(ws)
+
+    # ── mark_processing ────────────────────────────────────────────────────
+    elif args.cmd == "mark_processing":
+        flag = args.args[0].lower() if args.args else "true"
+        mark_processing(ws, processing=(flag in ("true", "1", "on")))
+        _ok(f"processing 锁已{'设置' if flag in ('true', '1', 'on') else '清除'}")
 
     # ── get_chats ──────────────────────────────────────────────────────────
     elif args.cmd == "get_chats":

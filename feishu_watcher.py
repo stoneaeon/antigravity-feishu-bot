@@ -45,6 +45,7 @@ CHAT_KEYCODE  = 34             # 'i' 的 macOS keycode（Cmd+Shift+I → 打开 
 CHAT_MODIFIER = "command down, shift down"
 POLL_INTERVAL = 2              # 队列检查间隔（秒）
 COOLDOWN_SEC  = 30             # 同批次消息最短触发间隔（秒），避免反复激活
+PROCESSING_TIMEOUT = 600       # processing 锁超时时间（秒），超时后视为死锁并重新触发
 TRIGGER_TEXT  = "."            # 触发 Agent 检查队列的输入（Agent 会忽略此文字，优先处理飞书消息）
 
 
@@ -166,15 +167,48 @@ def is_app_running(app_name: str) -> bool:
 
 
 # ── 消息队列读取 ──────────────────────────────────────────────────────────────
-def get_pending_messages(ws: Path) -> list:
+def get_pending_messages(ws: Path) -> tuple[list, bool, float]:
+    """
+    返回 (messages, is_processing, processing_elapsed_sec)。
+    is_processing: Agent 是否正在处理队列（processing 锁）
+    processing_elapsed_sec: 锁已持续的秒数（未锁定时为 0）
+    """
     qp = queue_path(ws)
     if not qp.exists():
-        return []
+        return [], False, 0.0
     try:
         data = json.loads(qp.read_text(encoding="utf-8"))
-        return data.get("messages", [])
+        msgs = data.get("messages", [])
+        is_processing = bool(data.get("processing", False))
+        elapsed = 0.0
+        if is_processing and data.get("processing_since"):
+            try:
+                since = datetime.datetime.strptime(
+                    data["processing_since"], "%Y-%m-%d %H:%M:%S"
+                )
+                elapsed = (datetime.datetime.now() - since).total_seconds()
+            except (ValueError, TypeError):
+                pass
+        return msgs, is_processing, elapsed
     except Exception:
-        return []
+        return [], False, 0.0
+
+
+def reset_processing_lock(ws: Path) -> None:
+    """重置 processing 锁（超时后由 watcher 调用，防止死锁）"""
+    qp = queue_path(ws)
+    if not qp.exists():
+        return
+    try:
+        data = json.loads(qp.read_text(encoding="utf-8"))
+        data.pop("processing", None)
+        data.pop("processing_since", None)
+        qp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 # ── macOS 系统通知 ────────────────────────────────────────────────────────────
@@ -280,8 +314,8 @@ def watch_loop(ws: Path, app_name: str) -> None:
 
     while True:
         try:
-            messages   = get_pending_messages(ws)
-            msg_count  = len(messages)
+            messages, is_processing, proc_elapsed = get_pending_messages(ws)
+            msg_count = len(messages)
 
             # ── 队列为空 ──────────────────────────────────────────────────
             if msg_count == 0:
@@ -298,6 +332,18 @@ def watch_loop(ws: Path, app_name: str) -> None:
                 preview = messages[-1].get("text", "")[:50]
                 log(f"📨 检测到 {msg_count} 条待处理消息：「{preview}」")
                 last_msg_count = msg_count
+
+            # ── Agent 正在处理中（processing 锁）──────────────────────
+            if is_processing:
+                if proc_elapsed < PROCESSING_TIMEOUT:
+                    # 锁未超时 → Agent 仍在处理，静静等待
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                else:
+                    # 锁已超时（超过 10 分钟）→ 疑似死锁，重置并重新触发
+                    log(f"⚠️  processing 锁已超时（{proc_elapsed:.0f}s），重置并重新触发")
+                    reset_processing_lock(ws)
+                    # 不 continue，落入下方触发逻辑
 
             # ── 冷却期内不重复触发 ───────────────────────────────────────
             elapsed = time.time() - last_trigger_ts
