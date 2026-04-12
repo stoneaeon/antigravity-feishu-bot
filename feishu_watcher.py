@@ -9,7 +9,7 @@ feishu_watcher.py  —  飞书消息自动激活器
   2. 聚焦 AI Chat 输入框（Cmd+Shift+I）
   3. 输入触发字符并回车 → Agent 读取飞书消息队列并处理
 
-支持 Mac 锁屏：锁屏时等待，解锁后立即激活。
+支持 Mac 息屏：自动唤醒显示器（caffeinate -u），无需手动操作。
 支持守护进程模式（--daemon）。
 
 ⚠️  首次运行需要授权（弹出一次权限请求）：
@@ -76,38 +76,41 @@ def log_path(ws: Path) -> Path:
     return ws / ".antigravity" / "feishu_watcher.log"
 
 
-# ── 屏幕锁定检测 ──────────────────────────────────────────────────────────────
-def is_screen_locked() -> bool:
+# ── 显示器休眠检测 ─────────────────────────────────────────────────────────────
+def is_display_asleep() -> bool:
     """
-    检测 Mac 屏幕是否处于锁定状态（锁屏或密码保护的屏保）。
+    检测 Mac 显示器是否处于休眠（熄屏）状态。
 
-    方法1（首选）：调用系统 Python + Quartz，读取 CGSession 状态。
-      - /usr/bin/python3 是 macOS 系统自带的，有 Quartz 框架访问权。
-      - 这是最准确的方法，能区分「关闭显示器」和「真正锁定」。
+    息屏时 AppleScript 的 keystroke 会被 macOS 静默丢弃，
+    必须先唤醒显示器再操作。
+
+    方法1（首选）：ctypes 调用 CoreGraphics CGDisplayIsAsleep()。
+      - 无需第三方库，直接调用系统动态库，在 macOS 26.x 上验证可用。
 
     方法2（备用）：读取 ioreg 中显示器电源状态。
-      - CurrentPowerState = 4 表示全亮；< 4 表示熄屏（近似等于锁定）。
-      - 不能区分用户手动关显示器 vs 锁定，但作为备用足够。
+      - CurrentPowerState = 4 表示全亮；< 4 表示熄屏。
+      - 新版 macOS 可能已移除 IODisplayWrangler 节点。
 
-    两种方法都失败时返回 False（假定未锁定，尽量不阻塞激活流程）。
+    方法3（备用）：pmset -g assertions 检查 UserIsActive 标志。
+      - UserIsActive = 0 近似表示用户无操作（显示器可能已休眠）。
+
+    所有方法都失败时返回 False（假定未休眠，尽量不阻塞激活流程）。
     """
-    # 方法1：Quartz CGSession（最准确）
+    # 方法1：CGDisplayIsAsleep via ctypes（最可靠，macOS 26.x 验证通过）
     try:
-        quartz_code = (
-            "from Quartz import CGSessionCopyCurrentDictionary;"
-            "d = CGSessionCopyCurrentDictionary();"
-            "print(int(bool(d and d.get('CGSSessionScreenIsLocked', 0))))"
-        )
-        result = subprocess.run(
-            ["/usr/bin/python3", "-c", quartz_code],
-            capture_output=True, text=True, timeout=3
-        )
-        if result.returncode == 0 and result.stdout.strip() in ("0", "1"):
-            return result.stdout.strip() == "1"
+        import ctypes
+        import ctypes.util
+        cg_path = ctypes.util.find_library('CoreGraphics')
+        if cg_path:
+            cg = ctypes.cdll.LoadLibrary(cg_path)
+            cg.CGMainDisplayID.restype = ctypes.c_uint32
+            cg.CGDisplayIsAsleep.restype = ctypes.c_bool
+            cg.CGDisplayIsAsleep.argtypes = [ctypes.c_uint32]
+            return bool(cg.CGDisplayIsAsleep(cg.CGMainDisplayID()))
     except Exception:
         pass
 
-    # 方法2：ioreg（备用近似检测）
+    # 方法2：ioreg IODisplayWrangler（旧版 macOS）
     try:
         result = subprocess.run(
             ["ioreg", "-n", "IODisplayWrangler"],
@@ -119,7 +122,43 @@ def is_screen_locked() -> bool:
     except Exception:
         pass
 
-    return False  # 无法判断，默认当作未锁定
+    # 方法3：pmset assertions（近似检测）
+    try:
+        result = subprocess.run(
+            ["pmset", "-g", "assertions"],
+            capture_output=True, text=True, timeout=3
+        )
+        # UserIsActive = 0 时，用户无活动，显示器很可能已休眠
+        match = re.search(r'UserIsActive\s+(\d+)', result.stdout)
+        if match:
+            return int(match.group(1)) == 0
+    except Exception:
+        pass
+
+    return False  # 无法判断，默认当作未休眠
+
+
+def wake_display() -> bool:
+    """
+    使用 caffeinate -u 唤醒显示器。
+
+    caffeinate -u 会创建一个 "user is active" 断言，
+    模拟用户活动，从而唤醒已休眠的显示器。
+    -t 5 表示保持 5 秒后自动释放。
+
+    注意：caffeinate -u -t N 会阻塞 N 秒，因此用 Popen 异步执行。
+    此方法不需要密码或用户交互（仅唤醒显示器，不解锁）。
+    """
+    try:
+        subprocess.Popen(
+            ["caffeinate", "-u", "-t", "5"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)  # 等待显示器完全亮起
+        return not is_display_asleep()
+    except Exception:
+        return False
 
 
 # ── 应用状态 ──────────────────────────────────────────────────────────────────
@@ -203,6 +242,30 @@ def reset_processing_lock(ws: Path) -> None:
         data = json.loads(qp.read_text(encoding="utf-8"))
         data.pop("processing", None)
         data.pop("processing_since", None)
+        qp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def set_processing_lock(ws: Path) -> None:
+    """
+    设置 processing 锁（watcher 触发成功后立即调用）。
+
+    作用：防止 watcher 在 Agent 处理期间重复触发。
+    Agent 处理完毕会清空队列（messages=[]}），watcher 检测到队列为空后
+    自然停止触发。如果 Agent 意外退出未清空队列，超时机制会在
+    PROCESSING_TIMEOUT 秒后自动重置锁并重新触发。
+    """
+    qp = queue_path(ws)
+    if not qp.exists():
+        return
+    try:
+        data = json.loads(qp.read_text(encoding="utf-8"))
+        data["processing"] = True
+        data["processing_since"] = now()
         qp.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -306,7 +369,6 @@ def watch_loop(ws: Path, app_name: str) -> None:
     """
     last_msg_count  = 0
     last_trigger_ts = 0.0
-    was_locked      = False
 
     log(f"∎ 监控启动 · 工作区: {ws}")
     log(f"  目标应用: {app_name}  |  队列: {queue_path(ws)}")
@@ -323,7 +385,6 @@ def watch_loop(ws: Path, app_name: str) -> None:
                     log("队列已清空（Agent 已处理）")
                 last_msg_count  = 0
                 last_trigger_ts = 0.0
-                was_locked      = False
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -351,21 +412,22 @@ def watch_loop(ws: Path, app_name: str) -> None:
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # ── 检查屏幕锁定状态 ─────────────────────────────────────────
-            locked = is_screen_locked()
-
-            if locked:
-                if not was_locked:
-                    log("🔒 屏幕已锁定，等待解锁后激活...")
-                    was_locked = True
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            if was_locked:
-                # 刚刚解锁
-                log("🔓 屏幕已解锁")
-                was_locked = False
-                time.sleep(1.5)  # 等待解锁动画完成，避免过早操作
+            # ── 检查显示器是否休眠，需要时主动唤醒 ─────────────────────
+            woke_from_sleep = False
+            if is_display_asleep():
+                log("💡 显示器休眠中，正在唤醒...")
+                woke_from_sleep = True
+                if not wake_display():
+                    log("⚠️  唤醒失败，等待下次重试")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                # 唤醒后二次确认
+                if is_display_asleep():
+                    log("⚠️  唤醒后显示器仍未亮起，跳过本轮")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                log("✅ 显示器已唤醒")
+                time.sleep(1)  # 额外等待显示器稳定
 
             # ── 检查应用是否在运行 ───────────────────────────────────────
             if not is_app_running(app_name):
@@ -373,15 +435,17 @@ def watch_loop(ws: Path, app_name: str) -> None:
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # ── 发送通知 + 激活应用 ──────────────────────────────────────
+            # ── 发送通知（仅息屏唤醒时）+ 激活应用 ─────────────────────
             preview  = messages[-1].get("text", "")[:40]
-            notif_body = f"{msg_count} 条待处理：{preview}" if preview else f"共 {msg_count} 条"
 
-            # 先发通知（无论 AppleScript 是否成功，用户都能看到）
-            send_notification(
-                title=f"📨 飞书任务 · {ws.name}",
-                body=notif_body
-            )
+            # 仅在息屏唤醒场景发送系统通知（作为备用提醒）
+            # 亮屏时直接激活 App 即可，不打扰用户
+            if woke_from_sleep:
+                notif_body = f"{msg_count} 条待处理：{preview}" if preview else f"共 {msg_count} 条"
+                send_notification(
+                    title=f"📨 飞书任务 · {ws.name}",
+                    body=notif_body
+                )
 
             # 构造触发文本：描述飞书消息，让 Agent 知道背景
             # （Agent 会读取队列中的完整内容，这里只是激活触发）
@@ -390,7 +454,8 @@ def watch_loop(ws: Path, app_name: str) -> None:
             ok = activate_and_trigger(app_name, trigger)
 
             if ok:
-                log(f"✅ 已激活，Agent 将在下一轮对话中处理飞书消息")
+                set_processing_lock(ws)
+                log(f"✅ 已激活并设置 processing 锁，Agent 处理完毕前不会重复触发")
             else:
                 log(f"⚠️  自动触发失败，已发送通知，请手动切换到 {app_name}")
 
