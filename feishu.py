@@ -171,6 +171,32 @@ def _api_post(endpoint: str, token: str, body: dict) -> dict:
         _err(f"API 请求失败: {e}")
         return {}
 
+def _api_upload(endpoint: str, token: str, file_path: str,
+                form_fields: dict, file_field_name: str = "file") -> dict:
+    """multipart/form-data 上传文件到飞书，返回响应 dict
+
+    file_field_name: 表单中文件字段的名称（图片用 'image'，文件用 'file'）
+    """
+    p = Path(file_path)
+    if not p.exists():
+        _err(f"文件不存在: {file_path}")
+        return {}
+    try:
+        with open(p, "rb") as f:
+            # form_fields: 额外的表单字段（如 image_type, file_type, file_name）
+            files = {file_field_name: (p.name, f)}
+            resp = requests.post(
+                f"{BASE}{endpoint}",
+                data=form_fields,
+                files=files,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=60,  # 大文件上传需要更长超时
+            )
+        return resp.json()
+    except requests.RequestException as e:
+        _err(f"上传失败: {e}")
+        return {}
+
 # ── 消息发送（统一入口，自动处理 p2p / group）────────────────────────────────
 def _send(token: str, cfg: dict, msg_type: str, content_obj: dict) -> bool:
     """
@@ -202,10 +228,18 @@ def _send(token: str, cfg: dict, msg_type: str, content_obj: dict) -> bool:
     return False
 
 def send_text(token: str, cfg: dict, text: str) -> bool:
+    # 飞书 text 消息限制约 4000 字符，超过时截断
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n...（内容过长，已截断）"
     return _send(token, cfg, "text", {"text": text})
 
 def send_card(token: str, cfg: dict, title: str, body: str,
               color: str = "blue") -> bool:
+    # 飞书卡片消息 content 限制 30KB，body 截断到 28KB 留余量
+    if len(body.encode("utf-8")) > 28000:
+        # 按字符截断（中文约 3 字节/字符），留出安全边际
+        max_chars = 9000
+        body = body[:max_chars] + "\n\n...（内容过长，已截断）"
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -229,6 +263,132 @@ def send_reaction(token: str, message_id: str, emoji: str = "OK") -> bool:
         return True
     _err(f"添加 Reaction 失败: {result.get('msg')} (code={result.get('code')})")
     return False
+
+def send_image(token: str, cfg: dict, image_path: str) -> bool:
+    """上传图片并发送到飞书。支持 JPG/PNG/WEBP/GIF/BMP 等，≤10MB。"""
+    p = Path(image_path)
+    if not p.exists():
+        _err(f"图片不存在: {image_path}")
+        return False
+    size_mb = p.stat().st_size / (1024 * 1024)
+    if size_mb > 10:
+        _err(f"图片超过 10MB 限制 ({size_mb:.1f}MB): {p.name}")
+        return False
+
+    # Step 1: 上传图片获取 image_key
+    _info(f"正在上传图片: {p.name} ({size_mb:.1f}MB)")
+    result = _api_upload(
+        "/im/v1/images", token, str(p),
+        {"image_type": "message"},
+        file_field_name="image",
+    )
+    image_key = result.get("data", {}).get("image_key", "")
+    if not image_key:
+        _err(f"图片上传失败: {result.get('msg', '未知错误')} (code={result.get('code')})")
+        return False
+
+    # Step 2: 发送图片消息
+    ok = _send(token, cfg, "image", {"image_key": image_key})
+    if ok:
+        _ok(f"图片已发送: {p.name}")
+    return ok
+
+def send_file(token: str, cfg: dict, file_path: str,
+              file_type: str = "") -> bool:
+    """上传文件并发送到飞书。≤30MB。
+
+    file_type 可选值: opus/mp4/pdf/doc/xls/ppt/stream
+    若不指定，根据后缀自动推断。
+    """
+    p = Path(file_path)
+    if not p.exists():
+        _err(f"文件不存在: {file_path}")
+        return False
+    size_mb = p.stat().st_size / (1024 * 1024)
+    if size_mb > 30:
+        _err(f"文件超过 30MB 限制 ({size_mb:.1f}MB): {p.name}")
+        return False
+
+    # 自动推断 file_type
+    if not file_type:
+        ext = p.suffix.lower().lstrip(".")
+        type_map = {
+            "pdf": "pdf", "doc": "doc", "docx": "doc",
+            "xls": "xls", "xlsx": "xls",
+            "ppt": "ppt", "pptx": "ppt",
+            "mp4": "mp4", "opus": "opus",
+        }
+        file_type = type_map.get(ext, "stream")
+
+    # Step 1: 上传文件获取 file_key
+    _info(f"正在上传文件: {p.name} ({size_mb:.1f}MB, type={file_type})")
+    result = _api_upload(
+        "/im/v1/files", token, str(p),
+        {"file_type": file_type, "file_name": p.name},
+    )
+    file_key = result.get("data", {}).get("file_key", "")
+    if not file_key:
+        _err(f"文件上传失败: {result.get('msg', '未知错误')} (code={result.get('code')})")
+        return False
+
+    # Step 2: 发送文件消息
+    ok = _send(token, cfg, "file", {"file_key": file_key})
+    if ok:
+        _ok(f"文件已发送: {p.name}")
+    return ok
+
+def download_resource(token: str, message_id: str, file_key: str,
+                      output_dir: str = "/tmp",
+                      filename: str = "") -> str:
+    """从飞书消息中下载资源文件（图片/文件）。
+
+    使用 im/v1/messages/:message_id/resources/:file_key 接口。
+    返回保存的文件路径，失败返回空字符串。
+    """
+    # 确定文件类型
+    url = f"{BASE}/im/v1/messages/{message_id}/resources/{file_key}"
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"type": "image"},  # image 或 file
+            timeout=30,
+            stream=True,
+        )
+        if resp.status_code != 200:
+            _err(f"资源下载失败: HTTP {resp.status_code}")
+            return ""
+
+        # 从 Content-Disposition 提取文件名（如有）
+        if not filename:
+            cd = resp.headers.get("Content-Disposition", "")
+            if "filename=" in cd:
+                filename = cd.split("filename=")[-1].strip('"').strip("'")
+            else:
+                # 根据 Content-Type 推断扩展名
+                ct = resp.headers.get("Content-Type", "")
+                ext_map = {
+                    "image/png": ".png", "image/jpeg": ".jpg",
+                    "image/gif": ".gif", "image/webp": ".webp",
+                    "application/pdf": ".pdf",
+                }
+                ext = ext_map.get(ct, ".bin")
+                # 使用完整的 file_key 防止相同前缀导致的覆盖
+                sanitized_key = file_key.replace("/", "_").replace("\\", "_")
+                filename = f"feishu_{sanitized_key}{ext}"
+
+        out_path = Path(output_dir) / filename
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        _ok(f"资源已下载: {out_path}")
+        return str(out_path)
+
+    except requests.RequestException as e:
+        _err(f"资源下载失败: {e}")
+        return ""
 
 # ── 功能 1：打开项目通知 ─────────────────────────────────────────────────────
 def send_open_message(cfg: dict = None, ws: Path = None) -> bool:
@@ -458,7 +618,8 @@ def main() -> None:
     parser.add_argument(
         "cmd", nargs="?", default="status",
         choices=["setup", "status", "test", "send_open_message",
-                 "send_result", "send_text", "send_reaction", "read_messages",
+                 "send_result", "send_text", "send_image", "send_file",
+                 "send_reaction", "read_messages", "download_resource",
                  "clear_messages", "mark_processing", "get_chats"],
     )
     parser.add_argument("args", nargs="*", help="命令附加参数")
@@ -546,6 +707,27 @@ def main() -> None:
         emoji = args.args[1] if len(args.args) > 1 else "OK"
         sys.exit(0 if send_reaction(token, msg_id, emoji) else 1)
 
+    # ── send_image ─────────────────────────────────────────────────────────
+    elif args.cmd == "send_image":
+        if not args.args:
+            _err("用法：python3 feishu.py send_image <图片路径>")
+            sys.exit(1)
+        token = get_token(cfg, ws)
+        if not token:
+            sys.exit(1)
+        sys.exit(0 if send_image(token, cfg, args.args[0]) else 1)
+
+    # ── send_file ──────────────────────────────────────────────────────────
+    elif args.cmd == "send_file":
+        if not args.args:
+            _err("用法：python3 feishu.py send_file <文件路径> [文件类型]")
+            sys.exit(1)
+        token = get_token(cfg, ws)
+        if not token:
+            sys.exit(1)
+        ft = args.args[1] if len(args.args) > 1 else ""
+        sys.exit(0 if send_file(token, cfg, args.args[0], file_type=ft) else 1)
+
     # ── read_messages ──────────────────────────────────────────────────────
     elif args.cmd == "read_messages":
         msgs = read_messages(ws, clear=True)
@@ -558,6 +740,27 @@ def main() -> None:
                     print(f"  [{m.get('time','')}] {m.get('text','')}")
             else:
                 _info("暂无待处理消息")
+
+    # ── download_resource ──────────────────────────────────────────────────
+    elif args.cmd == "download_resource":
+        if len(args.args) < 2:
+            _err("用法：python3 feishu.py download_resource <message_id> <file_key> [output_dir] [filename]")
+            sys.exit(1)
+        token = get_token(cfg, ws)
+        if not token:
+            sys.exit(1)
+        msg_id   = args.args[0]
+        file_key = args.args[1]
+        out_dir  = args.args[2] if len(args.args) > 2 else str(ws / ".antigravity" / "media")
+        filename = args.args[3] if len(args.args) > 3 else ""
+
+        saved_path = download_resource(token, msg_id, file_key, out_dir, filename)
+        if saved_path:
+            # 打印到 stdout，Agent 可以捕获以获取实际路径
+            print(f"DOWNLOADED:{saved_path}")
+            sys.exit(0)
+        else:
+            sys.exit(1)
 
     # ── clear_messages ─────────────────────────────────────────────────────
     elif args.cmd == "clear_messages":

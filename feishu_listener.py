@@ -103,26 +103,65 @@ def save_config(cfg: dict, ws: Path) -> None:
 
 # ── 消息内容解析 ─────────────────────────────────────────────────────────────
 def parse_text(msg_type: str, content_raw: str) -> str:
-    """将飞书消息 content（JSON 字符串）解析为纯文本"""
+    """将飞书消息 content（JSON 字符串）解析为纯文本
+
+    飞书消息的 content 字段通常是 JSON 字符串，解析后为 dict。
+    但某些消息类型（如系统通知）的 content 解析后可能是 str 而非 dict，
+    需要防御性处理，避免对 str 调用 .get() 导致 AttributeError。
+    """
     try:
         content = json.loads(content_raw)
     except (json.JSONDecodeError, TypeError):
         return content_raw or ""
 
+    # content 解析后不是 dict（例如纯字符串），直接返回其字符串形式
+    if not isinstance(content, dict):
+        return str(content).strip()
+
     if msg_type == "text":
         return content.get("text", "").strip()
 
     if msg_type == "post":
-        # 富文本：提取所有 text 元素
+        # 富文本结构：{"zh_cn": {"title": "...", "content": [[{tag, text}, ...], ...]}}
+        # 防御性解析：content.values() 为各语言版本，每个应为 dict
         parts = []
-        for lang_content in content.values():
-            for row in lang_content.get("content", []):
-                for elem in row:
-                    if elem.get("tag") == "text":
-                        parts.append(elem.get("text", ""))
+        try:
+            for lang_content in content.values():
+                if not isinstance(lang_content, dict):
+                    # 非 dict 的值（不符合预期的 post 结构），跳过
+                    continue
+                title = lang_content.get("title", "")
+                if title:
+                    parts.append(title)
+                for row in lang_content.get("content", []):
+                    if not isinstance(row, list):
+                        continue
+                    for elem in row:
+                        if not isinstance(elem, dict):
+                            continue
+                        # 提取所有带 text 字段的元素（text、a、at 等标签都可能含文本）
+                        t = elem.get("text", "")
+                        if t:
+                            parts.append(t)
+        except Exception:
+            # post 结构不符合预期时，回退到原始字符串
+            return content_raw.strip() if content_raw else ""
         return " ".join(parts).strip()
 
-    # 其他类型（图片、文件等）
+    if msg_type == "image":
+        # 图片消息：提取 image_key 供后续下载
+        image_key = content.get("image_key", "")
+        return f"[image:{image_key}]" if image_key else "[image]"
+
+    if msg_type == "file":
+        # 文件消息：提取 file_key 和文件名
+        file_key = content.get("file_key", "")
+        file_name = content.get("file_name", "")
+        if file_key:
+            return f"[file:{file_key}:{file_name}]" if file_name else f"[file:{file_key}]"
+        return "[file]"
+
+    # 其他类型（音频、视频、表情等）
     return f"[{msg_type}]"
 
 
@@ -193,7 +232,8 @@ class MessageHandler:
                 self._seen_ids = set(list(self._seen_ids)[-250:])
 
             # 解析消息文本
-            text = parse_text(message.message_type, message.content)
+            msg_type = message.message_type
+            text = parse_text(msg_type, message.content)
             if not text.strip():
                 return  # 忽略空消息
 
@@ -212,15 +252,37 @@ class MessageHandler:
                 save_config(self.cfg, self.ws)
                 pn = self.cfg.get("project_name") or self.ws.name
                 log.info(f"🎯 已自动记录目标 [{chat_type}]: {self.cfg['target_id'][:20]}...")
-                # 发送激活确认（以子进程方式调用 feishu.py，避免重复鉴权逻辑）
                 self._send_activation(pn)
 
-            # ── 写入消息队列 ────────────────────────────────────────────────
+            # ── 图片/文件消息：暂存并回复确认，等待后续指令 ──────────────────
+            is_media = msg_type in ("image", "file")
+            if is_media:
+                # 存入队列但标记为待指令，不触发 Agent 立即处理
+                record = {
+                    "message_id":  msg_id,
+                    "chat_type":   chat_type,
+                    "open_id":     open_id,
+                    "chat_id":     chat_id if chat_type == "group" else "",
+                    "msg_type":    msg_type,
+                    "text":        text,
+                    "time":        now(),
+                    "pending_instruction": True,
+                }
+                enqueue_message(self.ws, record)
+                log.info(f"📎 [{chat_type}] 收到{msg_type}，等待用户指令: {text[:60]}")
+                self._send_reaction(msg_id)
+                # 回复用户：已收到，等待指令
+                media_label = "图片" if msg_type == "image" else "文件"
+                self._reply_text(f"✅ 已收到{media_label}，需要怎么处理？")
+                return
+
+            # ── 写入消息队列（文本/富文本等常规消息）──────────────────────────
             record = {
                 "message_id":  msg_id,
                 "chat_type":   chat_type,
                 "open_id":     open_id,
                 "chat_id":     chat_id if chat_type == "group" else "",
+                "msg_type":    msg_type,
                 "text":        text,
                 "time":        now(),
             }
@@ -277,6 +339,26 @@ class MessageHandler:
                     "send_reaction",
                     msg_id,
                     "OK",
+                    "--workspace", str(self.ws),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+
+    def _reply_text(self, text: str) -> None:
+        """回复用户一条文本消息（子进程调用 feishu.py send_text）"""
+        import subprocess
+        feishu_py = Path(__file__).parent / "feishu.py"
+        if not feishu_py.exists():
+            return
+        try:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(feishu_py),
+                    "send_text", text,
                     "--workspace", str(self.ws),
                 ],
                 stdout=subprocess.DEVNULL,

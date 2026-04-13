@@ -2,13 +2,14 @@
 name: feishu-bot
 description: >
   飞书机器人双向集成。打开项目自动通知飞书，对话完成后推送结果，
-  接收飞书消息作为下一轮对话输入。支持 P2P 私聊（无需建群）和群聊。
-version: 2.1.0
+  接收飞书消息作为下一轮对话输入。支持发送文本、图片、文件。
+  支持 P2P 私聊（无需建群）和群聊。
+version: 3.0.0
 author: Antigravity Plugin
 tags: [feishu, notification, automation]
 ---
 
-# 飞书机器人集成技能 v2.1
+# 飞书机器人集成技能 v3.0
 
 ## 🗺️ 插件路径定位（每次执行命令前必须先做这一步）
 
@@ -106,6 +107,79 @@ python3 "$FEISHU_DIR/feishu_watcher.py" --daemon
 
 **完成后告知用户**：
 > ✅ 已绑定到本项目「{项目名}」！在飞书中向机器人发一条消息以激活通知。
+
+---
+
+### 📸 发送截图/图片到飞书
+
+**触发模式**：消息包含 `发飞书截图`、`发截图到飞书`、`send screenshot` 等，且指明了图片路径或要求截屏
+
+**执行步骤**：
+```bash
+# 定位插件
+FEISHU_PY="${FEISHU_PLUGIN_PATH}/feishu.py"
+[ ! -f "$FEISHU_PY" ] && FEISHU_PY=$(find "$HOME" -maxdepth 8 -name "feishu.py" -path "*/feishu-bot/feishu.py" 2>/dev/null | head -1)
+
+# 直接发送图片（支持 JPG/PNG/WEBP/GIF/BMP，<=10MB）
+python3 "$FEISHU_PY" send_image "/path/to/image.png" --workspace .
+```
+
+> 如果用户说"截屏发飞书"但未指定路径，先用 `screencapture` 截图再发送：
+> ```bash
+> screencapture -x /tmp/screenshot.png
+> python3 "$FEISHU_PY" send_image /tmp/screenshot.png --workspace .
+> ```
+
+---
+
+### 📎 发送文件到飞书
+
+**触发模式**：消息包含 `发飞书文件`、`发文件到飞书`、`send file` 等，且指明了文件路径
+
+**执行步骤**：
+```bash
+# 定位插件
+FEISHU_PY="${FEISHU_PLUGIN_PATH}/feishu.py"
+[ ! -f "$FEISHU_PY" ] && FEISHU_PY=$(find "$HOME" -maxdepth 8 -name "feishu.py" -path "*/feishu-bot/feishu.py" 2>/dev/null | head -1)
+
+# 直接发送文件（支持 PDF/DOC/XLS/PPT/MP4 等，<=30MB，自动推断类型）
+python3 "$FEISHU_PY" send_file "/path/to/document.pdf" --workspace .
+```
+
+---
+
+## 🛠 快速命令参考
+
+> Agent 可以直接用以下**一行命令**完成操作，**无需编写脚本**：
+
+| 操作 | 命令 |
+|------|------|
+| 发送文本 | `python3 "$FEISHU_PY" send_text "消息内容"` |
+| 发送图片 | `python3 "$FEISHU_PY" send_image /path/to/image.png` |
+| 发送文件 | `python3 "$FEISHU_PY" send_file /path/to/file.pdf` |
+| 发送卡片结果 | `python3 "$FEISHU_PY" send_result "摘要" "详情"` |
+| 发送表情回复 | `python3 "$FEISHU_PY" send_reaction <msg_id> OK` |
+| 下载飞书资源 | `python3 "$FEISHU_PY" download_resource <msg_id> <key> [出站目录] [文件名]` |
+| 读取消息队列 | `python3 "$FEISHU_PY" read_messages --json` |
+| 查看状态 | `python3 "$FEISHU_PY" status --json` |
+
+> 所有命令都支持 `--workspace /path` 参数指定工作区。
+
+---
+
+### 📥 接收与处理用户发送的图片/文件
+
+当用户向飞书机器人发送图片或文件时，机器人会自动回复"已收到，需要怎么处理？"并暂存消息而不立即触发任务。
+随后当用户发送文本指令（如"处理上面那张图片"）时，`read_messages` 的队列中会包含这几条消息。
+
+**如何提取附件**：
+如果消息 `text` 字段包含 `[image:image_key]` 或 `[file:file_key:文件名]` 这样的标签：
+1. 从中提取 `image_key` 或 `file_key`，并使用对应的 `message_id`
+2. 调用下载命令：
+   ```bash
+   python3 "$FEISHU_PY" download_resource <message_id> <image_key> [输出目录]
+   ```
+   *注意：如果成功，命令输出的最后一行会是 `DOWNLOADED:/绝对/文件/路径`。你可以捕获它以便处理。*
 
 ---
 

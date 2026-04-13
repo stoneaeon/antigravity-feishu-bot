@@ -359,6 +359,259 @@ end tell
 
 
 
+# ── Antigravity 异常检测 ──────────────────────────────────────────────────────
+# 已知的错误模式（需要足够具体，避免匹配到正常 UI 文本导致误报）
+ERROR_PATTERNS = [
+    # 模型用量上限（高优先级，通常需要切换模型）
+    "baseline model quota reached", "quota exceeded", "usage limit",
+    "rate limit", "rate_limit", "too many requests", "429",
+    "用量上限", "请求过多", "模型额度", "频率限制",
+    # 服务器忙 / 连接异常
+    "our servers are experiencing high traffic", "agent terminated due to error",
+    "server busy", "service unavailable", "503",
+    "internal server error", "500", "bad gateway", "502",
+    "gateway timeout", "504",
+    "服务器繁忙", "服务器错误", "服务不可用",
+    # 明确的错误提示（需要包含完整短语，避免子串误匹配）
+    "something went wrong", "an error occurred", "unexpected error",
+    "出现错误", "发生异常", "请求失败",
+    # 需要用户操作的阻断提示
+    "try again later", "please try again",
+    "请稍后重试", "请重试",
+]
+
+# 可点击的重试按钮文案（用于精确匹配按钮 title）
+RETRY_BUTTON_PATTERNS = [
+    "Retry", "Try Again", "Try again", "retry",
+    "重试", "再试一次",
+]
+
+ERROR_NOTIFY_COOLDOWN = 300  # 错误通知冷却（秒），避免刷屏
+
+
+def detect_app_error(app_name: str) -> tuple[str, bool]:
+    """
+    通过 AppleScript 读取 Antigravity 窗口中的 UI 文本，
+    检测是否存在错误状态。
+
+    返回 (error_text, buttons_str):
+      - error_text: 匹配到的错误文案（空字符串表示无错误）
+      - buttons_str: 窗口中所有按钮的文本集合字符串
+    """
+    # 使用 AXUIElement 提取窗口中所有可见文本
+    # 这个 AppleScript 会遍历 UI 元素树，收集所有 AXValue 和 AXTitle
+    applescript = f'''
+tell application "System Events"
+    if not (exists process "{app_name}") then
+        return "APP_NOT_RUNNING"
+    end if
+    tell process "{app_name}"
+        set allText to ""
+        set buttonNames to ""
+        set elemCount to 0
+        try
+            set frontWin to front window
+            set uiElements to entire contents of frontWin
+            repeat with elem in uiElements
+                -- 限制扫描元素数量，Electron 应用可能有上千个 UI 元素
+                set elemCount to elemCount + 1
+                if elemCount > 500 then exit repeat
+                try
+                    set elemRole to role of elem
+                    if elemRole is "AXStaticText" then
+                        set v to value of elem
+                        if v is not missing value then
+                            set allText to allText & v & "|||"
+                        end if
+                    end if
+                    if elemRole is "AXButton" then
+                        set btnTitle to title of elem
+                        if btnTitle is not missing value then
+                            set buttonNames to buttonNames & btnTitle & "|||"
+                        end if
+                    end if
+                end try
+            end repeat
+        end try
+        return allText & "###BUTTONS###" & buttonNames
+    end tell
+end tell
+'''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", applescript],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return "", False
+
+        output = result.stdout.strip()
+        if output == "APP_NOT_RUNNING":
+            return "", False
+
+        # 分离文本和按钮
+        parts = output.split("###BUTTONS###")
+        ui_text = parts[0].lower() if parts else ""
+        button_text = parts[1].lower() if len(parts) > 1 else ""
+
+        # 检查是否匹配错误模式
+        matched_error = ""
+        for pattern in ERROR_PATTERNS:
+            if pattern.lower() in ui_text:
+                matched_error = pattern
+                break
+
+        return matched_error, button_text
+
+    except (subprocess.TimeoutExpired, Exception):
+        return "", False
+
+
+def try_click_retry(app_name: str) -> bool:
+    """
+    尝试通过 Accessibility API 点击 Antigravity 窗口中的「重试」按钮。
+    返回 True 表示成功点击。
+    """
+    # 尝试多种按钮文案
+    for btn_name in RETRY_BUTTON_PATTERNS:
+        applescript = f'''
+tell application "System Events"
+    tell process "{app_name}"
+        try
+            set frontWin to front window
+            set retryBtn to first button of frontWin whose title is "{btn_name}"
+            click retryBtn
+            return "CLICKED"
+        end try
+        -- 深层搜索：在所有子元素中查找
+        try
+            set allBtns to every button of entire contents of front window
+            repeat with btn in allBtns
+                try
+                    if title of btn is "{btn_name}" then
+                        click btn
+                        return "CLICKED"
+                    end if
+                end try
+            end repeat
+        end try
+    end tell
+end tell
+return "NOT_FOUND"
+'''
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True, text=True, timeout=8
+            )
+            if "CLICKED" in result.stdout:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def try_handle_quota(app_name: str, target_model: str = "Gemini 3.1 Pro (High)") -> bool:
+    """
+    处理模型配额耗尽异常：
+    1. 点击 Dismiss 弹窗
+    2. 点击底部模型选择按钮
+    3. 在弹出的菜单中点击切换到目标模型
+    """
+    applescript = f'''
+tell application "System Events"
+    tell process "{app_name}"
+        -- 1. 点击 Dismiss 按钮
+        try
+            set allBtns to every button of entire contents of front window
+            repeat with btn in allBtns
+                try
+                    if title of btn is "Dismiss" then
+                        click btn
+                        delay 0.5
+                        exit repeat
+                    end if
+                end try
+            end repeat
+        end try
+
+        -- 2. 查找并点击模型选择按钮
+        -- 在输入框区域的模型按钮，它的 title 或者里面通常包含 "Claude", "Gemini", "GPT" 等
+        try
+            set allBtns to every button of entire contents of front window
+            repeat with btn in allBtns
+                try
+                    set btnTitle to title of btn
+                    if btnTitle is not missing value then
+                        if btnTitle contains "Claude" or btnTitle contains "Gemini" or btnTitle contains "GPT" or btnTitle contains "Sonnet" or btnTitle contains "Opus" then
+                            click btn
+                            delay 1
+                            exit repeat
+                        end if
+                    end if
+                end try
+            end repeat
+        end try
+
+        -- 3. 在弹出的列表中点击指定模型
+        try
+            set allElems to entire contents of front window
+            repeat with elem in allElems
+                try
+                    -- 可能是 AXButton 或 AXStaticText
+                    set elemRole to role of elem
+                    if elemRole is "AXStaticText" or elemRole is "AXButton" then
+                        set t to value of elem
+                        if t is missing value then set t to title of elem
+                        if t contains "{target_model}" then
+                            click elem
+                            return "SWITCHED"
+                        end if
+                    end if
+                end try
+            end repeat
+        end try
+    end tell
+end tell
+return "NOT_SWITCHED"
+'''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", applescript],
+            capture_output=True, text=True, timeout=15
+        )
+        if "SWITCHED" in result.stdout:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def notify_error_via_feishu(ws: Path, error_text: str,
+                            auto_handled: bool) -> None:
+    """通过飞书发送异常通知（调用 feishu.py send_text）"""
+    feishu_py = Path(__file__).parent / "feishu.py"
+    if not feishu_py.exists():
+        return
+
+    status = "✅ 已自动重试" if auto_handled else "⚠️ 需要人工处理"
+    msg = (
+        f"🚨 Antigravity 任务异常\n\n"
+        f"错误类型：{error_text}\n"
+        f"处理状态：{status}\n"
+        f"工作区：{ws.name}\n"
+        f"时间：{now()}"
+    )
+    try:
+        subprocess.Popen(
+            [sys.executable, str(feishu_py), "send_text", msg,
+             "--workspace", str(ws)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
 # ── 主监控循环 ────────────────────────────────────────────────────────────────
 def watch_loop(ws: Path, app_name: str) -> None:
     """
@@ -366,9 +619,12 @@ def watch_loop(ws: Path, app_name: str) -> None:
       - 每 POLL_INTERVAL 秒检查一次消息队列
       - 有新消息时，根据屏幕/应用状态决定下一步
       - 强制冷却时间（COOLDOWN_SEC），避免同批消息反复触发
+      - processing 期间定期检测 Antigravity UI 异常，发现则飞书通知 + 尝试自动恢复
     """
-    last_msg_count  = 0
-    last_trigger_ts = 0.0
+    last_msg_count     = 0
+    last_trigger_ts    = 0.0
+    last_error_notify  = 0.0     # 上次错误通知时间戳
+    error_check_count  = 0       # processing 期间的检测计数器
 
     log(f"∎ 监控启动 · 工作区: {ws}")
     log(f"  目标应用: {app_name}  |  队列: {queue_path(ws)}")
@@ -397,13 +653,55 @@ def watch_loop(ws: Path, app_name: str) -> None:
             # ── Agent 正在处理中（processing 锁）──────────────────────
             if is_processing:
                 if proc_elapsed < PROCESSING_TIMEOUT:
-                    # 锁未超时 → Agent 仍在处理，静静等待
+                    # 锁未超时 → Agent 仍在处理
+                    # 每隔 5 个轮询周期（约 10 秒）检测一次 UI 异常
+                    error_check_count += 1
+                    if error_check_count % 5 == 0 and is_app_running(app_name):
+                        error_text, buttons_str = detect_app_error(app_name)
+                        if error_text:
+                            log(f"🚨 检测到异常: {error_text}")
+                            auto_handled = False
+                            
+                            is_quota = any(q in error_text.lower() for q in ["quota", "usage limit", "rate limit", "用量上限"])
+                            
+                            if is_quota:
+                                log(f"  尝试自动切换模型 (配额超限)...")
+                                if try_handle_quota(app_name):
+                                    log("  ✅ 已自动切换备用模型")
+                                    # 切换后需要点击重试以恢复任务
+                                    log("  尝试点击重试以恢复任务...")
+                                    time.sleep(2)
+                                    if try_click_retry(app_name):
+                                        log("  ✅ 已成功续传任务")
+                                    auto_handled = True
+                                else:
+                                    log("  ⚠️  自动切换模型失败")
+                            else:
+                                # 尝试点击重试按钮
+                                has_retry = any(btn.lower() in buttons_str for btn in RETRY_BUTTON_PATTERNS)
+                                if has_retry or "retry" in buttons_str.lower():
+                                    log("  尝试自动点击重试按钮...")
+                                    if try_click_retry(app_name):
+                                        log("  ✅ 已自动点击重试")
+                                        auto_handled = True
+                                    else:
+                                        log("  ⚠️  自动点击失败")
+                            # 飞书通知（带冷却，避免刷屏）
+                            if time.time() - last_error_notify > ERROR_NOTIFY_COOLDOWN:
+                                notify_error_via_feishu(ws, error_text, auto_handled)
+                                send_notification(
+                                    title="🚨 Antigravity 异常",
+                                    body=f"{error_text} · {'已自动重试' if auto_handled else '需人工处理'}"
+                                )
+                                last_error_notify = time.time()
+                                log("  📨 已发送飞书异常通知")
                     time.sleep(POLL_INTERVAL)
                     continue
                 else:
                     # 锁已超时（超过 10 分钟）→ 疑似死锁，重置并重新触发
                     log(f"⚠️  processing 锁已超时（{proc_elapsed:.0f}s），重置并重新触发")
                     reset_processing_lock(ws)
+                    error_check_count = 0
                     # 不 continue，落入下方触发逻辑
 
             # ── 冷却期内不重复触发 ───────────────────────────────────────
