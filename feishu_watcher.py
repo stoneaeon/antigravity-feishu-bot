@@ -46,6 +46,7 @@ CHAT_MODIFIER = "command down, shift down"
 POLL_INTERVAL = 2              # 队列检查间隔（秒）
 COOLDOWN_SEC  = 30             # 同批次消息最短触发间隔（秒），避免反复激活
 PROCESSING_TIMEOUT = 600       # processing 锁超时时间（秒），超时后视为死锁并重新触发
+POST_PROC_DELAY   = 15         # 处理完毕后等待秒数，让 Antigravity 完全结束本轮对话再触发下一轮
 TRIGGER_TEXT  = "."            # 触发 Agent 检查队列的输入（Agent 会忽略此文字，优先处理飞书消息）
 
 
@@ -206,19 +207,21 @@ def is_app_running(app_name: str) -> bool:
 
 
 # ── 消息队列读取 ──────────────────────────────────────────────────────────────
-def get_pending_messages(ws: Path) -> tuple[list, bool, float]:
+def get_pending_messages(ws: Path) -> tuple[list, bool, float, int]:
     """
-    返回 (messages, is_processing, processing_elapsed_sec)。
+    返回 (messages, is_processing, processing_elapsed_sec, processing_msg_count)。
     is_processing: Agent 是否正在处理队列（processing 锁）
     processing_elapsed_sec: 锁已持续的秒数（未锁定时为 0）
+    processing_msg_count: 正在处理中的消息数量（processing_messages 列表长度）
     """
     qp = queue_path(ws)
     if not qp.exists():
-        return [], False, 0.0
+        return [], False, 0.0, 0
     try:
         data = json.loads(qp.read_text(encoding="utf-8"))
         msgs = data.get("messages", [])
         is_processing = bool(data.get("processing", False))
+        proc_msg_count = len(data.get("processing_messages", []))
         elapsed = 0.0
         if is_processing and data.get("processing_since"):
             try:
@@ -228,9 +231,9 @@ def get_pending_messages(ws: Path) -> tuple[list, bool, float]:
                 elapsed = (datetime.datetime.now() - since).total_seconds()
             except (ValueError, TypeError):
                 pass
-        return msgs, is_processing, elapsed
+        return msgs, is_processing, elapsed, proc_msg_count
     except Exception:
-        return [], False, 0.0
+        return [], False, 0.0, 0
 
 
 def reset_processing_lock(ws: Path) -> None:
@@ -295,66 +298,57 @@ def send_notification(title: str, body: str) -> None:
 # ── 激活 Antigravity + 触发对话 ──────────────────────────────────────────────
 def activate_and_trigger(app_name: str, text: str) -> bool:
     """
-    用 AppleScript 激活 Antigravity 并向 Chat 输入触发消息。
-
-    操作步骤（参考用户验证可行的命令）：
-      1. 在 System Events 内激活 App（inline tell，不用 tell process）
-      2. delay 1 → 等窗口渲染
-      3. Cmd+1 → 强制焦点回到代码编辑区第1列（已知稳定状态）
-      4. Cmd+L → 从代码区出发，100% 跳到 Antigravity Chat 输入框
-      5. delay 0.5 → 等 Chat 面板打开/聚焦
-      6. 将消息写入剪贴板，Cmd+V 粘贴（适配中文和特殊字符）
-      7. 按回车触发 Agent
-
-    ⚠️  首次需要辅助功能授权（系统设置 → 隐私与安全性 → 辅助功能 → 添加 Terminal）
-    ⚠️  息屏但不锁屏状态下同样有效（macOS 激活 App 时会自动唤醒显示器）
+    安全激活 Antigravity 并触发对话（借助 Vision OCR 防呆）。
     """
-    # 转义文本中的双引号和反斜杠，避免 AppleScript 字符串出错
     safe_text = text.replace("\\", "\\\\").replace('"', '\\"')
-
-    applescript = f"""
+    
+    # 1. 激活应用并把窗口带到最前
+    script_activate = f'tell application "{app_name}" to activate'
+    subprocess.run(["osascript", "-e", script_activate], timeout=5)
+    time.sleep(1) # 等待窗口显示与渲染
+    
+    # 2. 第一次尝试直接 OCR 点击输入框（如果面板已经处于展开状态，直接聚焦，防误关）
+    clicked = False
+    out = __run_vision("click", "Ask anything", "@ to mention")
+    if "CLICKING at" in out:
+        clicked = True
+        log("✅ 通过 Vision OCR 成功锁定并聚焦 Chat 输入框")
+        
+    # 3. 如果没点到，说明面板可能被折叠/关闭。此时盲按一次 Cmd+L 展开它，然后重新尝试点击
+    if not clicked:
+        log("⚠️ 未发现输入框，尝试 Cmd+L 展开面板...")
+        script_toggle = 'tell application "System Events" to keystroke "l" using command down'
+        subprocess.run(["osascript", "-e", script_toggle], timeout=5)
+        time.sleep(1) # 等待面板展开动画
+        
+        out2 = __run_vision("click", "Ask anything", "@ to mention")
+        if "CLICKING at" in out2:
+            clicked = True
+            log("✅ 重新展开后成功聚焦 Chat 输入框")
+            
+    # 4. 如果两次都没找到，直接放弃（总好过贴到代码安全区里导致后续处理锁死）
+    if not clicked:
+        log("❌ OCR 均未能锁定 Chat 输入框，放弃当前触发，避免污染代码区。")
+        # 返回 False 后，外层 watcher 不会上锁，下个轮询会自动重试。
+        return False
+        
+    # 5. 确认已成功聚焦后，粘贴文本并回车提交以触发 Agent 启动
+    script_paste = f"""
 tell application "System Events"
-    tell application "{app_name}" to activate
-    delay 1
-
-    -- Step 1：Cmd+1 强制焦点到代码编辑区第1列（稳定基准点）
-    -- 从此出发，Cmd+L 必定落到 Chat 输入框，不会跳走
-    keystroke "1" using command down
-    delay 0.1
-
-    -- Step 2：Cmd+L 打开/聚焦 Antigravity Chat 输入框
-    keystroke "l" using command down
-    delay 0.5
-
-    -- Step 3：通过剪贴板粘贴触发文本（比 keystroke 更可靠，支持中文）
     set the clipboard to "{safe_text}"
     keystroke "v" using command down
     delay 0.2
-
-    -- Step 4：回车提交，Agent 读取飞书消息队列并处理
     keystroke return
 end tell
-"""
+    """
     try:
-        result = subprocess.run(
-            ["osascript", "-e", applescript],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode != 0:
-            err = result.stderr.strip()
-            if "1002" in err or "not allowed" in err.lower() or "accessibility" in err.lower():
-                log("❌ 辅助功能未授权！")
-                log("   系统设置 → 隐私与安全性 → 辅助功能 → 添加 Terminal.app")
-                log("   授权后重新运行 watcher 即可，无需修改代码")
-            else:
-                log(f"⚠️  AppleScript 报错: {err[:150]}")
-            return False
+        subprocess.run(["osascript", "-e", script_paste], timeout=10)
         return True
     except subprocess.TimeoutExpired:
-        log("⚠️  AppleScript 超时（App 可能未响应）")
+        log("⚠️  AppleScript 粘贴操作超时")
         return False
     except Exception as e:
-        log(f"⚠️  执行异常: {e}")
+        log(f"⚠️  执行粘贴异常: {e}")
         return False
 
 
@@ -368,10 +362,10 @@ ERROR_PATTERNS = [
     "用量上限", "请求过多", "模型额度", "频率限制",
     # 服务器忙 / 连接异常
     "our servers are experiencing high traffic", "agent terminated due to error",
-    "server busy", "service unavailable", "503",
+    "server busy", "service unavailable", "503", "overload", "overloaded",
     "internal server error", "500", "bad gateway", "502",
     "gateway timeout", "504",
-    "服务器繁忙", "服务器错误", "服务不可用",
+    "服务器繁忙", "服务器错误", "服务不可用", "超载", "超负荷",
     # 明确的错误提示（需要包含完整短语，避免子串误匹配）
     "something went wrong", "an error occurred", "unexpected error",
     "出现错误", "发生异常", "请求失败",
@@ -389,201 +383,85 @@ RETRY_BUTTON_PATTERNS = [
 ERROR_NOTIFY_COOLDOWN = 300  # 错误通知冷却（秒），避免刷屏
 
 
+def __run_vision(mode: str, *targets: str) -> str:
+    """内部辅助方法：截屏并运行 mac_vision 二进制进行 OCR 提取和点击"""
+    screen_path = "/tmp/ag_vision_tmp.png"
+    # 静默全屏截取（可绕过应用无障碍限制）
+    subprocess.run(["screencapture", "-x", screen_path])
+    
+    mac_vision_bin = Path(__file__).parent.parent / ".antigravity" / "mac_vision"
+    if not mac_vision_bin.exists():
+        return ""
+    
+    cmd = [str(mac_vision_bin), screen_path, mode] + list(targets)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
 def detect_app_error(app_name: str) -> tuple[str, bool]:
     """
-    通过 AppleScript 读取 Antigravity 窗口中的 UI 文本，
-    检测是否存在错误状态。
+    通过 macOS 原生 Vision OCR (基于截屏) 读取 Antigravity 窗口文本，
+    检测是否存在错误状态，不再依赖 Electron 失效的 DOM Tree。
 
-    返回 (error_text, buttons_str):
+    返回 (error_text, all_text):
       - error_text: 匹配到的错误文案（空字符串表示无错误）
-      - buttons_str: 窗口中所有按钮的文本集合字符串
+      - all_text: 屏幕上收集到的所有文本（用于后续按钮辅助匹配）
     """
-    # 使用 AXUIElement 提取窗口中所有可见文本
-    # 这个 AppleScript 会遍历 UI 元素树，收集所有 AXValue 和 AXTitle
-    applescript = f'''
-tell application "System Events"
-    if not (exists process "{app_name}") then
-        return "APP_NOT_RUNNING"
-    end if
-    tell process "{app_name}"
-        set allText to ""
-        set buttonNames to ""
-        set elemCount to 0
-        try
-            set frontWin to front window
-            set uiElements to entire contents of frontWin
-            repeat with elem in uiElements
-                -- 限制扫描元素数量，Electron 应用可能有上千个 UI 元素
-                set elemCount to elemCount + 1
-                if elemCount > 500 then exit repeat
-                try
-                    set elemRole to role of elem
-                    if elemRole is "AXStaticText" then
-                        set v to value of elem
-                        if v is not missing value then
-                            set allText to allText & v & "|||"
-                        end if
-                    end if
-                    if elemRole is "AXButton" then
-                        set btnTitle to title of elem
-                        if btnTitle is not missing value then
-                            set buttonNames to buttonNames & btnTitle & "|||"
-                        end if
-                    end if
-                end try
-            end repeat
-        end try
-        return allText & "###BUTTONS###" & buttonNames
-    end tell
-end tell
-'''
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", applescript],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
-            return "", False
-
-        output = result.stdout.strip()
-        if output == "APP_NOT_RUNNING":
-            return "", False
-
-        # 分离文本和按钮
-        parts = output.split("###BUTTONS###")
-        ui_text = parts[0].lower() if parts else ""
-        button_text = parts[1].lower() if len(parts) > 1 else ""
-
-        # 检查是否匹配错误模式
-        matched_error = ""
-        for pattern in ERROR_PATTERNS:
-            if pattern.lower() in ui_text:
-                matched_error = pattern
-                break
-
-        return matched_error, button_text
-
-    except (subprocess.TimeoutExpired, Exception):
+    if not is_app_running(app_name):
         return "", False
+
+    out = __run_vision("detect")
+    all_text = " ".join(
+        line.replace("FOUND: ", "").strip()
+        for line in out.splitlines()
+        if line.startswith("FOUND: ")
+    ).lower()
+
+    if not all_text:
+        return "", False
+
+    matched_error = ""
+    for pattern in ERROR_PATTERNS:
+        if pattern.lower() in all_text:
+            matched_error = pattern
+            break
+
+    return matched_error, all_text
 
 
 def try_click_retry(app_name: str) -> bool:
     """
-    尝试通过 Accessibility API 点击 Antigravity 窗口中的「重试」按钮。
-    返回 True 表示成功点击。
+    尝试通过 Vision OCR 点击「重试」相关的文字坐标。
+    返回 True 表示成功点拨。
     """
-    # 尝试多种按钮文案
-    for btn_name in RETRY_BUTTON_PATTERNS:
-        applescript = f'''
-tell application "System Events"
-    tell process "{app_name}"
-        try
-            set frontWin to front window
-            set retryBtn to first button of frontWin whose title is "{btn_name}"
-            click retryBtn
-            return "CLICKED"
-        end try
-        -- 深层搜索：在所有子元素中查找
-        try
-            set allBtns to every button of entire contents of front window
-            repeat with btn in allBtns
-                try
-                    if title of btn is "{btn_name}" then
-                        click btn
-                        return "CLICKED"
-                    end if
-                end try
-            end repeat
-        end try
-    end tell
-end tell
-return "NOT_FOUND"
-'''
-        try:
-            result = subprocess.run(
-                ["osascript", "-e", applescript],
-                capture_output=True, text=True, timeout=8
-            )
-            if "CLICKED" in result.stdout:
-                return True
-        except Exception:
-            continue
-    return False
+    out = __run_vision("click", "retry", "重试", "再试一次", "try again")
+    return "CLICKING at" in out
 
 
-def try_handle_quota(app_name: str, target_model: str = "Gemini 3.1 Pro (High)") -> bool:
+def try_handle_quota(app_name: str, target_models: list = ["high", "gemini", "claude", "gpt", "sonnet"]) -> bool:
     """
     处理模型配额耗尽异常：
-    1. 点击 Dismiss 弹窗
-    2. 点击底部模型选择按钮
-    3. 在弹出的菜单中点击切换到目标模型
+    1. 点击底部模型选择按钮（根据现有模型展示词点击）
+    2. 在弹出的菜单中依次点击目标备用模型名单，点中为止。
     """
-    applescript = f'''
-tell application "System Events"
-    tell process "{app_name}"
-        -- 1. 点击 Dismiss 按钮
-        try
-            set allBtns to every button of entire contents of front window
-            repeat with btn in allBtns
-                try
-                    if title of btn is "Dismiss" then
-                        click btn
-                        delay 0.5
-                        exit repeat
-                    end if
-                end try
-            end repeat
-        end try
-
-        -- 2. 查找并点击模型选择按钮
-        -- 在输入框区域的模型按钮，它的 title 或者里面通常包含 "Claude", "Gemini", "GPT" 等
-        try
-            set allBtns to every button of entire contents of front window
-            repeat with btn in allBtns
-                try
-                    set btnTitle to title of btn
-                    if btnTitle is not missing value then
-                        if btnTitle contains "Claude" or btnTitle contains "Gemini" or btnTitle contains "GPT" or btnTitle contains "Sonnet" or btnTitle contains "Opus" then
-                            click btn
-                            delay 1
-                            exit repeat
-                        end if
-                    end if
-                end try
-            end repeat
-        end try
-
-        -- 3. 在弹出的列表中点击指定模型
-        try
-            set allElems to entire contents of front window
-            repeat with elem in allElems
-                try
-                    -- 可能是 AXButton 或 AXStaticText
-                    set elemRole to role of elem
-                    if elemRole is "AXStaticText" or elemRole is "AXButton" then
-                        set t to value of elem
-                        if t is missing value then set t to title of elem
-                        if t contains "{target_model}" then
-                            click elem
-                            return "SWITCHED"
-                        end if
-                    end if
-                end try
-            end repeat
-        end try
-    end tell
-end tell
-return "NOT_SWITCHED"
-'''
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", applescript],
-            capture_output=True, text=True, timeout=15
-        )
-        if "SWITCHED" in result.stdout:
+    # 查找并点击模型选择按钮。优先匹配带 ^ 符号的底边栏按钮名称，防止点击到含有这些词的聊天记录
+    out = __run_vision("click", "^ claude", "^ gemini", "^ gpt", "^ sonnet", "^ opus", "^ high", "claude", "gemini")
+    if "CLICKING at" not in out:
+        pass # 找不到也不要直接退出，可能有别的方式触发展开或者本来就是展开的
+        
+    time.sleep(1.5)  # 等待模型列表弹窗渲染
+    
+    # 备选的高精度全称列表（防误触聊天记录）
+    safe_target_models = ["Gemini 3.1 Pro", "Gemini 3.1", "Claude Opus 4.6", "Claude 3.5 Sonnet"]
+    
+    for tm in safe_target_models:
+        clicked_out = __run_vision("click", tm)
+        if "CLICKING at" in clicked_out:
             return True
-    except Exception:
-        pass
+            
+    # 全称未识别到时则彻底放弃选模型，直接抛出失败，不再进行盲目的键盘注入兜底，以保证不会产生副作用。
     return False
 
 
@@ -625,6 +503,7 @@ def watch_loop(ws: Path, app_name: str) -> None:
     last_trigger_ts    = 0.0
     last_error_notify  = 0.0     # 上次错误通知时间戳
     error_check_count  = 0       # processing 期间的检测计数器
+    was_processing     = False   # 上一轮是否在处理中（用于检测处理完毕→新消息的转换）
 
     log(f"∎ 监控启动 · 工作区: {ws}")
     log(f"  目标应用: {app_name}  |  队列: {queue_path(ws)}")
@@ -632,23 +511,8 @@ def watch_loop(ws: Path, app_name: str) -> None:
 
     while True:
         try:
-            messages, is_processing, proc_elapsed = get_pending_messages(ws)
+            messages, is_processing, proc_elapsed, proc_msg_count = get_pending_messages(ws)
             msg_count = len(messages)
-
-            # ── 队列为空 ──────────────────────────────────────────────────
-            if msg_count == 0:
-                if last_msg_count > 0:
-                    log("队列已清空（Agent 已处理）")
-                last_msg_count  = 0
-                last_trigger_ts = 0.0
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            # ── 有新消息（数量增加时记录日志）──────────────────────────
-            if msg_count != last_msg_count:
-                preview = messages[-1].get("text", "")[:50]
-                log(f"📨 检测到 {msg_count} 条待处理消息：「{preview}」")
-                last_msg_count = msg_count
 
             # ── Agent 正在处理中（processing 锁）──────────────────────
             if is_processing:
@@ -668,24 +532,27 @@ def watch_loop(ws: Path, app_name: str) -> None:
                                 log(f"  尝试自动切换模型 (配额超限)...")
                                 if try_handle_quota(app_name):
                                     log("  ✅ 已自动切换备用模型")
-                                    # 切换后需要点击重试以恢复任务
-                                    log("  尝试点击重试以恢复任务...")
+                                    # 切换完模型后，重新输入任务重新触发
+                                    log("  尝试重新输入任务发回车...")
                                     time.sleep(2)
-                                    if try_click_retry(app_name):
-                                        log("  ✅ 已成功续传任务")
-                                    auto_handled = True
+                                    resume_trigger = f"检查飞书消息队列（{msg_count} 条待处理） --workspace {ws}"
+                                    if activate_and_trigger(app_name, resume_trigger):
+                                        log("  ✅ 已成功重新输入任务发回车")
+                                        auto_handled = True
+                                    else:
+                                        log("  ⚠️  重新发回车失败")
+                                        auto_handled = True # 依然当做被处理了，防止无限循环
+
                                 else:
                                     log("  ⚠️  自动切换模型失败")
                             else:
-                                # 尝试点击重试按钮
-                                has_retry = any(btn.lower() in buttons_str for btn in RETRY_BUTTON_PATTERNS)
-                                if has_retry or "retry" in buttons_str.lower():
-                                    log("  尝试自动点击重试按钮...")
-                                    if try_click_retry(app_name):
-                                        log("  ✅ 已自动点击重试")
-                                        auto_handled = True
-                                    else:
-                                        log("  ⚠️  自动点击失败")
+                                # 对于其它异常，直接去点击上方的重试按钮
+                                log("  尝试找 Retry 按钮点击重试...")
+                                if try_click_retry(app_name):
+                                    log("  ✅ 已成功点击 Retry 按钮")
+                                    auto_handled = True
+                                else:
+                                    log("  ⚠️  自动点击 Retry 失败")
                             # 飞书通知（带冷却，避免刷屏）
                             if time.time() - last_error_notify > ERROR_NOTIFY_COOLDOWN:
                                 notify_error_via_feishu(ws, error_text, auto_handled)
@@ -704,11 +571,47 @@ def watch_loop(ws: Path, app_name: str) -> None:
                     error_check_count = 0
                     # 不 continue，落入下方触发逻辑
 
-            # ── 冷却期内不重复触发 ───────────────────────────────────────
+            # ── 队列为空判定 ─────────────────────────────────────────────
+            # 必须三个条件同时满足才算真正处理完毕：
+            #   1. messages[] 为空（无新消息）
+            #   2. processing_messages[] 为空（无正在处理的消息）
+            #   3. processing 锁已释放
+            # 否则只是 read_messages 搬运了数据，Agent 还在处理中
+            if msg_count == 0 and proc_msg_count == 0 and not is_processing:
+                if last_msg_count > 0:
+                    log("✅ 队列已清空，所有任务处理完毕")
+                last_msg_count  = 0
+                last_trigger_ts = 0.0
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # messages 为空但仍有 processing_messages 或 processing 锁
+            # → Agent 正在处理中，等待完成（不要误判为清空）
+            if msg_count == 0 and (proc_msg_count > 0 or is_processing):
+                was_processing = True
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            # ── 处理刚完毕，有新消息待处理 → 等待 Antigravity 完全结束对话 ─
+            # Agent 刚完成上一轮任务，Antigravity UI 可能还没准备好接收新输入
+            # 如果立刻触发，文本会堆到 Pending messages 而不是被提交
+            if was_processing and msg_count > 0:
+                log(f"⏳ 上轮处理刚完毕，等待 {POST_PROC_DELAY}s 再触发下一轮（{msg_count} 条待处理）")
+                was_processing = False
+                time.sleep(POST_PROC_DELAY)
+                continue  # 重新进入循环检查最新状态
+
+            # ── 冷却期与防重检查 ───────────────────────────────────────
             elapsed = time.time() - last_trigger_ts
             if last_trigger_ts > 0 and elapsed < COOLDOWN_SEC:
                 time.sleep(POLL_INTERVAL)
                 continue
+
+            # ── 有新消息（且处于冷却期外）────────────────────────────
+            # 只要是没有处理锁且队内有消息，即刻开始排队执行下一轮任务流
+            preview = messages[-1].get("text", "")[:50]
+            log(f"📨 检测到 {msg_count} 条待处理消息：「{preview}」")
+            last_msg_count = msg_count
 
             # ── 检查显示器是否休眠，需要时主动唤醒 ─────────────────────
             woke_from_sleep = False
@@ -747,8 +650,9 @@ def watch_loop(ws: Path, app_name: str) -> None:
 
             # 构造触发文本：描述飞书消息，让 Agent 知道背景
             # （Agent 会读取队列中的完整内容，这里只是激活触发）
-            trigger = f"检查飞书消息队列（{msg_count} 条待处理）"
-            log(f"激活 {app_name} 并触发对话...")
+            # 带上 --workspace 路径，防止多项目冲突时 Agent 读错队列
+            trigger = f"检查飞书消息队列（{msg_count} 条待处理） --workspace {ws}"
+            log(f"激活 {app_name} 并触发对话...（工作区: {ws.name}）")
             ok = activate_and_trigger(app_name, trigger)
 
             if ok:
