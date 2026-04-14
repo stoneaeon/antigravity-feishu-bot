@@ -479,8 +479,8 @@ def mark_processing(ws: Path = None, processing: bool = True) -> None:
 def read_messages(ws: Path = None, clear: bool = True) -> list:
     """
     读取由 feishu_listener.py 写入的消息队列。
-    clear=True 时读取后自动清空队列，并清除 processing 锁。
-    读取后、清空前会标记 processing=True，通知 watcher 不要重复触发。
+    clear=True 时，将待处理消息转移到 processing_messages 列表而不再直接删除。
+    这样用户可以明确看到正在处理的内容。
     """
     ws = ws or find_workspace()
     qp = queue_path(ws)
@@ -490,10 +490,16 @@ def read_messages(ws: Path = None, clear: bool = True) -> list:
         data = json.loads(qp.read_text(encoding="utf-8"))
         msgs = data.get("messages", [])
         if clear and msgs:
-            # 标记 processing 后清空队列，watcher 看到空队列即不再触发
+            # 将阅读的消息移入 processing_messages 供透明显示，设置锁定
+            data["processing_messages"] = msgs
+            data["messages"] = []
+            data["last_read"] = now()
+            data["processing"] = True
+            if "processing_since" not in data:
+                data["processing_since"] = now()
+            
             qp.write_text(
-                json.dumps({"messages": [], "last_read": now()},
-                           ensure_ascii=False, indent=2),
+                json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         elif msgs:
@@ -504,16 +510,34 @@ def read_messages(ws: Path = None, clear: bool = True) -> list:
         _err(f"读取消息队列失败: {e}")
         return []
 
-def clear_messages(ws: Path = None) -> None:
+def clear_messages(ws: Path = None) -> int:
+    """清除已处理的消息和 processing 锁，返回仍待处理的新消息数量。
+
+    如果在 Agent 处理期间有新消息到达（listener 写入 messages[]），
+    这些新消息会被保留，不会被清除。返回值 > 0 表示还有新任务需要处理。
+    """
     ws = ws or find_workspace()
     qp = queue_path(ws)
     qp.parent.mkdir(parents=True, exist_ok=True)
-    qp.write_text(
-        json.dumps({"messages": [], "cleared": now()},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    _ok("消息队列已清空")
+    try:
+        data = json.loads(qp.read_text(encoding="utf-8")) if qp.exists() else {}
+        data["processing_messages"] = []
+        data.pop("processing", None)
+        data.pop("processing_since", None)
+        data["cleared"] = now()
+        qp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        remaining = len(data.get("messages", []))
+        if remaining > 0:
+            _warn(f"还有 {remaining} 条新消息在队列中等待处理（watcher 将自动触发下一轮）")
+        else:
+            _ok("消息队列及处理锁已清空")
+        return remaining
+    except (json.JSONDecodeError, OSError) as e:
+        _err(f"清空消息队列时出错：{e}")
+        return 0
 
 # ── 一键绑定（magic prompt 由 SKILL.md 触发）─────────────────────────────────
 def setup(app_id: str, app_secret: str,
@@ -543,6 +567,42 @@ def setup(app_id: str, app_secret: str,
 
     save_config(cfg, ws)
     _ok(f"绑定成功！配置已写入 {cfg_path(ws)}")
+
+    # 自动生成 .vscode/tasks.json 以支持 IDE 打开时自启动守护进程
+    try:
+        tasks_dir = ws / ".vscode"
+        tasks_dir.mkdir(parents=True, exist_ok=True)
+        tasks_file = tasks_dir / "tasks.json"
+        
+        task_obj = {
+            "label": "Antigravity Feishu Auto-Start",
+            "type": "shell",
+            "command": "FEISHU_PY=\"${FEISHU_PLUGIN_PATH:-$HOME/Antigravity/AFPlugin/feishu-bot}/feishu.py\"; if [ -d \".antigravity\" ] && [ -f \".antigravity/feishu_config.json\" ] && [ -f \"$FEISHU_PY\" ]; then FEISHU_DIR=$(dirname \"$FEISHU_PY\"); python3 \"$FEISHU_PY\" send_open_message; python3 \"$FEISHU_DIR/feishu_listener.py\" --status >/dev/null 2>&1 || python3 \"$FEISHU_DIR/feishu_listener.py\" --daemon; python3 \"$FEISHU_DIR/feishu_watcher.py\" --status >/dev/null 2>&1 || python3 \"$FEISHU_DIR/feishu_watcher.py\" --daemon; fi",
+            "runOptions": {"runOn": "folderOpen"},
+            "presentation": {"reveal": "never", "panel": "shared", "clear": True, "close": True}
+        }
+
+        tasks_data = {"version": "2.0.0", "tasks": []}
+        if tasks_file.exists():
+            try:
+                tasks_data = json.loads(tasks_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        
+        existing_task = False
+        for t in tasks_data.setdefault("tasks", []):
+            if type(t) is dict and t.get("label") == "Antigravity Feishu Auto-Start":
+                t.update(task_obj)
+                existing_task = True
+                break
+                
+        if not existing_task:
+            tasks_data["tasks"].append(task_obj)
+            
+        tasks_file.write_text(json.dumps(tasks_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _info("已生成 .vscode/tasks.json，下次打开项目时飞书守护进程将自动启动")
+    except Exception as e:
+        _warn(f"生成自启动任务配置失败: {e}")
 
     print()
     print("  ┌──────────────────────────────────────────────────────┐")
@@ -665,8 +725,19 @@ def main() -> None:
             print(f"  双向通信  : {'✅ 已激活 (' + cfg.get('target_type','') + ')' if has_target(cfg) else '⏳ 等待首次飞书消息激活'}")
             print(f"  打开通知  : {'✅' if cfg.get('notify_on_open') else '❌'}")
             print(f"  完成推送  : {'✅' if cfg.get('notify_on_completion') else '❌'}")
-            if msgs:
-                print(f"  待处理消息: {len(msgs)} 条")
+            
+            try:
+                qp_data = json.loads(queue_path(ws).read_text(encoding="utf-8")) if queue_path(ws).exists() else {}
+                p_msgs = qp_data.get("processing_messages", [])
+                if msgs:
+                    print(f"  待处理消息: {len(msgs)} 条")
+                if p_msgs:
+                    print(f"  处理中消息: {len(p_msgs)} 条 (正在执行)")
+                    for m in p_msgs:
+                        print(f"    - {m.get('text', '')[:40]}...")
+            except:
+                if msgs:
+                    print(f"  待处理消息: {len(msgs)} 条")
 
     # ── test ───────────────────────────────────────────────────────────────
     elif args.cmd == "test":

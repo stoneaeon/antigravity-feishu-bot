@@ -47,6 +47,8 @@ POLL_INTERVAL = 2              # 队列检查间隔（秒）
 COOLDOWN_SEC  = 30             # 同批次消息最短触发间隔（秒），避免反复激活
 PROCESSING_TIMEOUT = 600       # processing 锁超时时间（秒），超时后视为死锁并重新触发
 POST_PROC_DELAY   = 15         # 处理完毕后等待秒数，让 Antigravity 完全结束本轮对话再触发下一轮
+MAX_CONSECUTIVE_ERRORS = 3     # 连续重试失败上限（3次×10秒），超过后释放锁让用户可通过飞书恢复
+ERROR_BACKOFF_BASE = 10        # 错误重试间隔（秒），固定10秒
 TRIGGER_TEXT  = "."            # 触发 Agent 检查队列的输入（Agent 会忽略此文字，优先处理飞书消息）
 
 
@@ -374,12 +376,6 @@ ERROR_PATTERNS = [
     "请稍后重试", "请重试",
 ]
 
-# 可点击的重试按钮文案（用于精确匹配按钮 title）
-RETRY_BUTTON_PATTERNS = [
-    "Retry", "Try Again", "Try again", "retry",
-    "重试", "再试一次",
-]
-
 ERROR_NOTIFY_COOLDOWN = 300  # 错误通知冷却（秒），避免刷屏
 
 
@@ -410,7 +406,7 @@ def detect_app_error(app_name: str) -> tuple[str, bool]:
       - all_text: 屏幕上收集到的所有文本（用于后续按钮辅助匹配）
     """
     if not is_app_running(app_name):
-        return "", False
+        return "", ""
 
     out = __run_vision("detect")
     all_text = " ".join(
@@ -420,7 +416,7 @@ def detect_app_error(app_name: str) -> tuple[str, bool]:
     ).lower()
 
     if not all_text:
-        return "", False
+        return "", ""
 
     matched_error = ""
     for pattern in ERROR_PATTERNS:
@@ -431,13 +427,37 @@ def detect_app_error(app_name: str) -> tuple[str, bool]:
     return matched_error, all_text
 
 
+
 def try_click_retry(app_name: str) -> bool:
     """
-    尝试通过 Vision OCR 点击「重试」相关的文字坐标。
-    返回 True 表示成功点拨。
+    处理 Antigravity 错误弹窗，恢复到可操作状态。
+
+    已知问题：Retry 按钮是蓝色背景+白色文字，macOS Vision OCR
+    无法识别 "Retry" 文本。
+
+    解决方案（Dismiss + 重触发）：
+      1. OCR 能可靠识别到 "Dismiss" 按钮
+      2. 点击 Dismiss 关闭错误弹窗，恢复到正常输入界面
+      3. 返回 "DISMISSED" 告知调用方需要通过输入框重新触发任务
+
+    返回值含义：
+      True  = 弹窗已关闭（通过 Dismiss），调用方应重新触发任务
+      False = 未能关闭弹窗
     """
-    out = __run_vision("click", "retry", "重试", "再试一次", "try again")
-    return "CLICKING at" in out
+    # 直接通过 OCR 点击 Dismiss 按钮（OCR 能可靠识别）
+    out = __run_vision("click", "Dismiss")
+    if "CLICKING at" in out:
+        log("    → ✅ 已通过 OCR 点击 Dismiss 关闭错误弹窗")
+        return True
+
+    # 备选：中文界面的关闭按钮
+    out2 = __run_vision("click", "关闭", "取消")
+    if "CLICKING at" in out2:
+        log("    → ✅ 通过中文按钮关闭弹窗")
+        return True
+
+    log("    → ❌ 未能定位任何可点击的按钮")
+    return False
 
 
 def try_handle_quota(app_name: str, target_models: list = ["high", "gemini", "claude", "gpt", "sonnet"]) -> bool:
@@ -446,8 +466,8 @@ def try_handle_quota(app_name: str, target_models: list = ["high", "gemini", "cl
     1. 点击底部模型选择按钮（根据现有模型展示词点击）
     2. 在弹出的菜单中依次点击目标备用模型名单，点中为止。
     """
-    # 查找并点击模型选择按钮。优先匹配带 ^ 符号的底边栏按钮名称，防止点击到含有这些词的聊天记录
-    out = __run_vision("click", "^ claude", "^ gemini", "^ gpt", "^ sonnet", "^ opus", "^ high", "claude", "gemini")
+    # 查找并点击模型选择按钮。用全称匹配，避免误点聊天记录中的相似文字
+    out = __run_vision("click", "claude", "gemini", "gpt", "sonnet", "opus", "high")
     if "CLICKING at" not in out:
         pass # 找不到也不要直接退出，可能有别的方式触发展开或者本来就是展开的
         
@@ -465,21 +485,54 @@ def try_handle_quota(app_name: str, target_models: list = ["high", "gemini", "cl
     return False
 
 
+def _classify_error(error_text: str) -> str:
+    """将错误文本分类为用户可读的错误类型"""
+    et = error_text.lower()
+    if any(q in et for q in ["quota", "usage limit", "用量上限", "模型额度"]):
+        return "🔴 模型配额耗尽"
+    if any(q in et for q in ["rate limit", "rate_limit", "too many requests", "429", "请求过多", "频率限制"]):
+        return "🟡 请求频率限制"
+    if any(q in et for q in ["503", "high traffic", "overload", "服务器繁忙", "超载"]):
+        return "🟠 服务器繁忙/过载"
+    if any(q in et for q in ["500", "internal server error", "服务器错误"]):
+        return "🔴 服务器内部错误"
+    if any(q in et for q in ["502", "bad gateway", "504", "gateway timeout"]):
+        return "🟠 网关错误/超时"
+    if any(q in et for q in ["agent terminated", "terminated due to error"]):
+        return "🔴 Agent 异常终止"
+    if any(q in et for q in ["something went wrong", "an error occurred", "unexpected error", "出现错误"]):
+        return "🔴 未知错误"
+    return f"⚪ 其他异常: {error_text}"
+
+
 def notify_error_via_feishu(ws: Path, error_text: str,
-                            auto_handled: bool) -> None:
-    """通过飞书发送异常通知（调用 feishu.py send_text）"""
+                            auto_handled: bool,
+                            retry_count: int = 0,
+                            lock_released: bool = False) -> None:
+    """通过飞书发送异常通知（调用 feishu.py send_text），包含具体异常分类"""
     feishu_py = Path(__file__).parent / "feishu.py"
     if not feishu_py.exists():
         return
 
+    error_category = _classify_error(error_text)
     status = "✅ 已自动重试" if auto_handled else "⚠️ 需要人工处理"
-    msg = (
-        f"🚨 Antigravity 任务异常\n\n"
-        f"错误类型：{error_text}\n"
-        f"处理状态：{status}\n"
-        f"工作区：{ws.name}\n"
-        f"时间：{now()}"
-    )
+    
+    parts = [
+        f"🚨 Antigravity 任务异常\n",
+        f"异常分类：{error_category}",
+        f"原始信息：{error_text}",
+        f"处理状态：{status}",
+    ]
+    if retry_count > 0:
+        parts.append(f"已重试次数：{retry_count}")
+    if lock_released:
+        parts.append(f"\n🔓 processing 锁已释放，你可以直接发消息给我来恢复操作")
+    parts.extend([
+        f"工作区：{ws.name}",
+        f"时间：{now()}",
+    ])
+    
+    msg = "\n".join(parts)
     try:
         subprocess.Popen(
             [sys.executable, str(feishu_py), "send_text", msg,
@@ -503,6 +556,7 @@ def watch_loop(ws: Path, app_name: str) -> None:
     last_trigger_ts    = 0.0
     last_error_notify  = 0.0     # 上次错误通知时间戳
     error_check_count  = 0       # processing 期间的检测计数器
+    consecutive_errors = 0       # 连续错误计数（用于退避和上限判断）
     was_processing     = False   # 上一轮是否在处理中（用于检测处理完毕→新消息的转换）
 
     log(f"∎ 监控启动 · 工作区: {ws}")
@@ -514,6 +568,18 @@ def watch_loop(ws: Path, app_name: str) -> None:
             messages, is_processing, proc_elapsed, proc_msg_count = get_pending_messages(ws)
             msg_count = len(messages)
 
+            # ── Bug 2 修复：跳过仅含 pending_instruction 的图片消息 ────
+            # 如果所有消息都是 pending_instruction=true（图片等待后续文字指令），
+            # 不触发 Agent，等用户发送文字指令后再一起处理
+            actionable_count = sum(
+                1 for m in messages
+                if not m.get("pending_instruction", False)
+            )
+            if msg_count > 0 and actionable_count == 0 and not is_processing:
+                # 所有消息都在等后续指令，不触发
+                time.sleep(POLL_INTERVAL)
+                continue
+
             # ── Agent 正在处理中（processing 锁）──────────────────────
             if is_processing:
                 if proc_elapsed < PROCESSING_TIMEOUT:
@@ -523,7 +589,9 @@ def watch_loop(ws: Path, app_name: str) -> None:
                     if error_check_count % 5 == 0 and is_app_running(app_name):
                         error_text, buttons_str = detect_app_error(app_name)
                         if error_text:
-                            log(f"🚨 检测到异常: {error_text}")
+                            consecutive_errors += 1
+                            error_category = _classify_error(error_text)
+                            log(f"🚨 检测到异常 [{consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}]: {error_category} ({error_text})")
                             auto_handled = False
                             
                             is_quota = any(q in error_text.lower() for q in ["quota", "usage limit", "rate limit", "用量上限"])
@@ -532,36 +600,71 @@ def watch_loop(ws: Path, app_name: str) -> None:
                                 log(f"  尝试自动切换模型 (配额超限)...")
                                 if try_handle_quota(app_name):
                                     log("  ✅ 已自动切换备用模型")
-                                    # 切换完模型后，重新输入任务重新触发
-                                    log("  尝试重新输入任务发回车...")
-                                    time.sleep(2)
-                                    resume_trigger = f"检查飞书消息队列（{msg_count} 条待处理） --workspace {ws}"
-                                    if activate_and_trigger(app_name, resume_trigger):
-                                        log("  ✅ 已成功重新输入任务发回车")
-                                        auto_handled = True
-                                    else:
-                                        log("  ⚠️  重新发回车失败")
-                                        auto_handled = True # 依然当做被处理了，防止无限循环
-
+                                    auto_handled = True
+                                    consecutive_errors = 0
+                                    # 不重新注入trigger（会堆积在Pending messages）
+                                    # 释放锁，飞书通知用户重新发消息
+                                    reset_processing_lock(ws)
+                                    notify_error_via_feishu(
+                                        ws, error_text, auto_handled=True,
+                                        retry_count=consecutive_errors,
+                                        lock_released=True,
+                                    )
+                                    log("  📨 已通知用户模型已切换，请重新发消息")
+                                    continue
                                 else:
                                     log("  ⚠️  自动切换模型失败")
                             else:
-                                # 对于其它异常，直接去点击上方的重试按钮
-                                log("  尝试找 Retry 按钮点击重试...")
+                                # 对于其它异常（服务器忙、Agent 终止等）
+                                # 点击 Dismiss 关闭弹窗，保持 processing 锁
+                                # 不释放锁、不重触发（避免 trigger text 堆积，即 Bug 4）
+                                # 如果弹窗关闭后 Agent 能恢复，锁会在队列清空时自然释放
+                                # 如果连续失败达到上限，下方逻辑会释放锁
+                                log("  尝试关闭错误弹窗（Dismiss）...")
                                 if try_click_retry(app_name):
-                                    log("  ✅ 已成功点击 Retry 按钮")
+                                    log("  ✅ 弹窗已关闭，保持 processing 锁等待恢复")
                                     auto_handled = True
                                 else:
-                                    log("  ⚠️  自动点击 Retry 失败")
-                            # 飞书通知（带冷却，避免刷屏）
-                            if time.time() - last_error_notify > ERROR_NOTIFY_COOLDOWN:
-                                notify_error_via_feishu(ws, error_text, auto_handled)
+                                    log("  ⚠️  未能关闭弹窗")
+                            
+                            # ── 连续错误超限：释放 processing 锁 ──────────
+                            # 非模型配额类错误连续多次失败后，释放锁，
+                            # 让用户可以通过飞书发消息来恢复操作
+                            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS and not is_quota:
+                                log(f"⚠️  连续 {consecutive_errors} 次异常，释放 processing 锁")
+                                log(f"  🔓 用户可通过飞书发送消息来恢复操作")
+                                reset_processing_lock(ws)
+                                consecutive_errors = 0
+                                # 立即发飞书通知，告知用户锁已释放
+                                notify_error_via_feishu(
+                                    ws, error_text, auto_handled=False,
+                                    retry_count=MAX_CONSECUTIVE_ERRORS,
+                                    lock_released=True,
+                                )
                                 send_notification(
-                                    title="🚨 Antigravity 异常",
-                                    body=f"{error_text} · {'已自动重试' if auto_handled else '需人工处理'}"
+                                    title="🔓 Processing 锁已释放",
+                                    body=f"连续 {MAX_CONSECUTIVE_ERRORS} 次异常 · 发飞书消息可恢复"
                                 )
                                 last_error_notify = time.time()
-                                log("  📨 已发送飞书异常通知")
+                                log("  📨 已发送飞书通知（锁释放）")
+                                # 退避等待，给服务器恢复时间
+                                backoff = ERROR_BACKOFF_BASE * MAX_CONSECUTIVE_ERRORS
+                                log(f"  ⏳ 退避等待 {backoff}s...")
+                                time.sleep(backoff)
+                                continue  # 跳过下方的常规通知
+                            
+                            # ── 固定间隔等待（10秒）──────────────────────
+                            if consecutive_errors >= 1:
+                                log(f"  ⏳ 等待 {ERROR_BACKOFF_BASE}s 后重试...")
+                                time.sleep(ERROR_BACKOFF_BASE)
+                            
+                            # 中间重试阶段不发飞书通知（只记日志），
+                            # 仅在最终释放锁时发一条汇总通知（见上方连续错误超限逻辑）
+                        else:
+                            # 无错误检测到，重置连续错误计数
+                            if consecutive_errors > 0:
+                                log(f"  ✅ 异常已恢复（之前连续 {consecutive_errors} 次）")
+                                consecutive_errors = 0
                     time.sleep(POLL_INTERVAL)
                     continue
                 else:

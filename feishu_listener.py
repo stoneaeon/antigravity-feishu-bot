@@ -169,9 +169,11 @@ def parse_text(msg_type: str, content_raw: str) -> str:
 _queue_lock = threading.Lock()
 
 
-def enqueue_message(ws: Path, record: dict) -> None:
-    """线程安全地向消息队列追加一条消息，内置 message_id 去重"""
+def enqueue_message(ws: Path, record: dict) -> tuple[bool, int]:
+    """线程安全地向消息队列追加一条消息，内置 message_id 去重，返回 (是否正在处理, 队列总长)"""
     qp = queue_path(ws)
+    is_proc = False
+    queue_len = 0
     with _queue_lock:
         qp.parent.mkdir(parents=True, exist_ok=True)
 
@@ -179,6 +181,7 @@ def enqueue_message(ws: Path, record: dict) -> None:
         if qp.exists():
             try:
                 data = json.loads(qp.read_text(encoding="utf-8"))
+                is_proc = bool(data.get("processing", False))
             except (json.JSONDecodeError, OSError):
                 data = {"messages": []}
         else:
@@ -188,15 +191,17 @@ def enqueue_message(ws: Path, record: dict) -> None:
         existing_ids = {m.get("message_id") for m in data["messages"]}
         if record.get("message_id") in existing_ids:
             log.debug(f"重复消息，跳过: {record.get('message_id')}")
-            return
+            return is_proc, len(data["messages"])
 
         data["messages"].append(record)
         data["last_updated"] = now()
+        queue_len = len(data["messages"])
 
         qp.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        return is_proc, queue_len
 
 
 # ── 消息处理器 ───────────────────────────────────────────────────────────────
@@ -286,9 +291,12 @@ class MessageHandler:
                 "text":        text,
                 "time":        now(),
             }
-            enqueue_message(self.ws, record)
+            is_proc, q_len = enqueue_message(self.ws, record)
             log.info(f"📨 [{chat_type}] {text[:60]}")
             self._send_reaction(msg_id)
+            if is_proc:
+                log.info(f"⏸️ 当前有任务在处理，向用户发送排队提示 (第 {q_len} 位)")
+                self._reply_text(f"⏸️ [系统忙碌] 当前有个极耗时的任务正占用机器人跑动中！\n您的新指令已成功入队 (当前等待顺位：{q_len})，等手头一忙完立刻自动无缝接力为您执行！")
 
         except Exception as e:
             log.error(f"消息处理异常: {e}", exc_info=True)

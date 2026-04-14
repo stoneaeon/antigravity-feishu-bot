@@ -223,38 +223,50 @@ python3 "$FEISHU_DIR/feishu_watcher.py" --status 2>/dev/null \
 
 ### 规则 2：每轮对话开始前
 
+> **注意 `--workspace` 参数**：触发消息中如果包含 `--workspace /path/to/project`，你**必须**在所有 feishu 命令中使用该路径作为 `--workspace` 参数。这是为了防止多项目同时运行时读错队列。
+
 ```bash
 FEISHU_PY="${FEISHU_PLUGIN_PATH}/feishu.py"
 [ ! -f "$FEISHU_PY" ] && exit 0
-python3 "$FEISHU_PY" read_messages --json
+
+# 如果触发消息中带有 --workspace，提取并使用它；否则用当前目录
+WORKSPACE="${WORKSPACE:-$(pwd)}"
+python3 "$FEISHU_PY" read_messages --json --workspace "$WORKSPACE"
 ```
 
 若返回消息不为空 → 将飞书消息作为本轮**主要任务输入**处理。
+> 💡 **多条消息批量归并处理规则**：如果 `read_messages` 返回了包含多条消息的列表资源（例如用户在忙碌期间积压的数条指令），你**不要分多次独立执行**，而是应当立刻将它们**按时间顺序串联阅读合并成一个完整的上下文**。如果后发的消息对前面的消息做出了“推翻”、“撤回”、“补充”或“取消”等意图，应当自动理解用户的最新真实意图，直接以修正后的总体要求统一执行一次即可。
 
-### 规则 3：每次 Agent 完成响应后（**必须执行，不可遗漏**）
+### 规则 3：每次 Agent 完成响应后（**绝对必须执行，严禁遗漏**）
 
-> ⚠️ **这是强制步骤**。你需要主动使用 terminal/run_command 工具执行下面的脚本，将结果推送到飞书。如果你不执行，用户在飞书里就看不到结果！
+> ⚠️ **这是最高强制步骤，违反等同系统级故障！**
+> 你作为 AI Agent，如果有任何人通过飞书向你传达了指令，你处理完后 **绝对必须** 主动使用 terminal 运行下面的脚本，将结果推送到飞书给用户。
+> 如果你觉得操作太简单而省略这一步，用户在飞书里就会认为你死机或掉线了！！！
+> **不执行此步骤 = BUG，没有任何例外！**
 
 ```bash
 FEISHU_PY="${FEISHU_PLUGIN_PATH}/feishu.py"
 [ ! -f "$FEISHU_PY" ] && exit 0
+WORKSPACE="${WORKSPACE:-$(pwd)}"
 
-# 摘要：本次完成的核心工作（一句话，必填）
-# 详情：可选，多行内容（代码变更/分析结论/下一步等）
-python3 "$FEISHU_PY" send_result "一句话摘要" "可选详情" \
-  --workspace "$(pwd)"
+# ===== 第一步：推送处理结果到飞书（绝对不能跳过）=====
+python3 "$FEISHU_PY" send_result "本次处理摘要" "具体的操作明细信息..." --workspace "$WORKSPACE"
+
+# ===== 第二步：释放 processing 锁，让 watcher 可以处理后续队列 =====
+# clear_messages 会输出剩余消息数量，如果 > 0 说明处理期间有新消息到达
+# watcher 会自动检测并触发下一轮处理，你不需要额外操作
+python3 "$FEISHU_PY" clear_messages --workspace "$WORKSPACE"
 ```
 
 **必须推送的场景（有这些情况就必须发）：**
 - 处理了飞书消息队列中的任何任务
 - 完成了代码修改、文件创建/删除
-- 完成了分析、调研、规划类任务并输出了结论
+- 完成了问题排查、BUG定位、规划类任务并输出了结论
 - 执行了用户通过飞书发来的任何指令
 
-**可跳过的场景（只有这几种才能跳过）：**
-- 用户在本轮对话中说了"不用通知"/"不用发飞书"
+**可跳过的场景（只有这两种才能跳过）：**
+- 用户明确说"不用通知"/"不要回发"
 - 飞书插件未配置（`status --json` 返回 `configured: false`）
-- 本轮是纯问答闲聊，无任何实际操作或输出
 
 
 ---
