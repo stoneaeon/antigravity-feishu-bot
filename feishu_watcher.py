@@ -399,13 +399,13 @@ end tell
 ERROR_PATTERNS = [
     # 模型用量上限（高优先级，通常需要切换模型）
     "baseline model quota reached", "quota exceeded", "usage limit",
-    "rate limit", "rate_limit", "too many requests", "429",
+    "rate limit", "rate_limit", "too many requests", "error 429", "status 429",
     "用量上限", "请求过多", "模型额度", "频率限制",
     # 服务器忙 / 连接异常
     "our servers are experiencing high traffic", "agent terminated due to error",
-    "server busy", "service unavailable", "503", "overload", "overloaded",
-    "internal server error", "500", "bad gateway", "502",
-    "gateway timeout", "504",
+    "server busy", "service unavailable", "error 503", "status 503", "overload", "overloaded",
+    "internal server error", "error 500", "status 500", "bad gateway", "error 502", "status 502",
+    "gateway timeout", "error 504", "status 504",
     "服务器繁忙", "服务器错误", "服务不可用", "超载", "超负荷",
     # 明确的错误提示（需要包含完整短语，避免子串误匹配）
     "something went wrong", "an error occurred", "unexpected error",
@@ -529,13 +529,13 @@ def _classify_error(error_text: str) -> str:
     et = error_text.lower()
     if any(q in et for q in ["quota", "usage limit", "用量上限", "模型额度"]):
         return "🔴 模型配额耗尽"
-    if any(q in et for q in ["rate limit", "rate_limit", "too many requests", "429", "请求过多", "频率限制"]):
+    if any(q in et for q in ["rate limit", "rate_limit", "too many requests", "error 429", "status 429", "请求过多", "频率限制"]):
         return "🟡 请求频率限制"
-    if any(q in et for q in ["503", "high traffic", "overload", "服务器繁忙", "超载"]):
+    if any(q in et for q in ["error 503", "status 503", "high traffic", "overload", "服务器繁忙", "超载"]):
         return "🟠 服务器繁忙/过载"
-    if any(q in et for q in ["500", "internal server error", "服务器错误"]):
+    if any(q in et for q in ["error 500", "status 500", "internal server error", "服务器错误"]):
         return "🔴 服务器内部错误"
-    if any(q in et for q in ["502", "bad gateway", "504", "gateway timeout"]):
+    if any(q in et for q in ["error 502", "status 502", "error 504", "status 504", "bad gateway", "gateway timeout"]):
         return "🟠 网关错误/超时"
     if any(q in et for q in ["agent terminated", "terminated due to error"]):
         return "🔴 Agent 异常终止"
