@@ -19,6 +19,7 @@ feishu.py — 飞书 App Bot 核心脚本
 import os
 import sys
 import json
+import fcntl
 import time
 import datetime
 import argparse
@@ -63,6 +64,29 @@ def queue_path(ws: Path) -> Path:
 
 def token_cache_path(ws: Path) -> Path:
     return ws / ".antigravity" / ".feishu_token_cache.json"
+
+
+def _locked_queue_rw(qp: Path, writer=None):
+    """跨进程安全地读写队列文件。
+
+    使用 fcntl.flock() 实现进程间互斥，防止 listener/watcher/Agent
+    同时读写 JSON 文件导致数据竞态。
+
+    writer=None: 只读，返回 data dict
+    writer=callable: 读取后调用 writer(data)，写回文件，返回 data
+    """
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = qp.with_suffix(".lock")
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = json.loads(qp.read_text(encoding="utf-8")) if qp.exists() else {"messages": []}
+            if writer:
+                writer(data)
+                qp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            return data
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 # ── 配置管理 ──────────────────────────────────────────────────────────────────
 DEFAULTS: dict = {
@@ -479,7 +503,7 @@ def mark_processing(ws: Path = None, processing: bool = True) -> None:
 def read_messages(ws: Path = None, clear: bool = True) -> list:
     """
     读取由 feishu_listener.py 写入的消息队列。
-    clear=True 时，将待处理消息转移到 processing_messages 列表而不再直接删除。
+    clear=True 时，将待处理消息追加到 processing_messages 列表（不覆盖旧数据）。
     这样用户可以明确看到正在处理的内容。
     """
     ws = ws or find_workspace()
@@ -487,26 +511,35 @@ def read_messages(ws: Path = None, clear: bool = True) -> list:
     if not qp.exists():
         return []
     try:
-        data = json.loads(qp.read_text(encoding="utf-8"))
-        msgs = data.get("messages", [])
-        if clear and msgs:
-            # 将阅读的消息移入 processing_messages 供透明显示，设置锁定
-            data["processing_messages"] = msgs
-            data["messages"] = []
-            data["last_read"] = now()
-            data["processing"] = True
-            if "processing_since" not in data:
-                data["processing_since"] = now()
-            
-            qp.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        elif msgs:
-            # 不清空时，标记 processing 防止 watcher 重复触发
-            mark_processing(ws, processing=True)
-        return msgs
-    except (json.JSONDecodeError, OSError) as e:
+        captured_msgs = []
+
+        def _do_read(data):
+            msgs = data.get("messages", [])
+            captured_msgs.extend(msgs)
+            if clear and msgs:
+                # 追加到 processing_messages（而非覆盖，防止上轮崩溃残留消息被丢弃）
+                existing_proc = data.get("processing_messages", [])
+                data["processing_messages"] = existing_proc + msgs
+                data["messages"] = []
+                data["last_read"] = now()
+                data["processing"] = True
+                data["agent_read_at"] = now()  # Agent 心跳标记，供 watcher 确认 Agent 已启动
+                if "processing_since" not in data:
+                    data["processing_since"] = now()
+            elif msgs:
+                # 不清空时，标记 processing 防止 watcher 重复触发
+                data["processing"] = True
+                data["agent_read_at"] = now()
+                if "processing_since" not in data:
+                    data["processing_since"] = now()
+
+        _locked_queue_rw(qp, writer=_do_read if clear else None)
+        if not clear:
+            # 只读模式：从文件中读取但不修改
+            data = _locked_queue_rw(qp)
+            return data.get("messages", [])
+        return captured_msgs
+    except Exception as e:
         _err(f"读取消息队列失败: {e}")
         return []
 
@@ -519,23 +552,27 @@ def clear_messages(ws: Path = None) -> int:
     ws = ws or find_workspace()
     qp = queue_path(ws)
     qp.parent.mkdir(parents=True, exist_ok=True)
+    result = {"remaining": 0}
     try:
-        data = json.loads(qp.read_text(encoding="utf-8")) if qp.exists() else {}
-        data["processing_messages"] = []
-        data.pop("processing", None)
-        data.pop("processing_since", None)
-        data["cleared"] = now()
-        qp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        remaining = len(data.get("messages", []))
-        if remaining > 0:
-            _warn(f"还有 {remaining} 条新消息在队列中等待处理（watcher 将自动触发下一轮）")
+        def _do_clear(data):
+            cleared_count = len(data.get("processing_messages", []))
+            data["processing_messages"] = []
+            data.pop("processing", None)
+            data.pop("processing_since", None)
+            data.pop("agent_read_at", None)
+            data["cleared"] = now()
+            result["remaining"] = len(data.get("messages", []))
+            if cleared_count > 0:
+                _info(f"已清除 {cleared_count} 条已处理消息")
+
+        _locked_queue_rw(qp, writer=_do_clear)
+
+        if result["remaining"] > 0:
+            _warn(f"还有 {result['remaining']} 条新消息在队列中等待处理（watcher 将自动触发下一轮）")
         else:
             _ok("消息队列及处理锁已清空")
-        return remaining
-    except (json.JSONDecodeError, OSError) as e:
+        return result["remaining"]
+    except Exception as e:
         _err(f"清空消息队列时出错：{e}")
         return 0
 

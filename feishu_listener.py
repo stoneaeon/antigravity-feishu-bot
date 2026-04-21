@@ -23,6 +23,7 @@ feishu_listener.py — 飞书消息监听 Daemon
 import os
 import sys
 import json
+import fcntl
 import signal
 import logging
 import datetime
@@ -79,6 +80,29 @@ def pid_path(ws: Path) -> Path:
 
 def log_path(ws: Path) -> Path:
     return ws / ".antigravity" / "feishu_listener.log"
+
+
+def _locked_queue_rw(qp: Path, writer=None):
+    """跨进程安全地读写队列文件。
+
+    使用 fcntl.flock() 实现进程间互斥，防止 listener/watcher/Agent
+    同时读写 JSON 文件导致数据竞态。
+
+    writer=None: 只读，返回 data dict
+    writer=callable: 读取后调用 writer(data)，写回文件，返回 data
+    """
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = qp.with_suffix(".lock")
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = json.loads(qp.read_text(encoding="utf-8")) if qp.exists() else {"messages": []}
+            if writer:
+                writer(data)
+                qp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            return data
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 # ── 配置读写 ─────────────────────────────────────────────────────────────────
@@ -165,43 +189,34 @@ def parse_text(msg_type: str, content_raw: str) -> str:
     return f"[{msg_type}]"
 
 
-# ── 消息队列写入（线程安全）───────────────────────────────────────────────────
+# ── 消息队列写入（跨进程安全）─────────────────────────────────────────────────
 _queue_lock = threading.Lock()
 
 
 def enqueue_message(ws: Path, record: dict) -> tuple[bool, int]:
-    """线程安全地向消息队列追加一条消息，内置 message_id 去重，返回 (是否正在处理, 队列总长)"""
+    """跨进程安全地向消息队列追加一条消息，内置 message_id 去重，返回 (是否正在处理, 队列总长)"""
     qp = queue_path(ws)
-    is_proc = False
-    queue_len = 0
-    with _queue_lock:
-        qp.parent.mkdir(parents=True, exist_ok=True)
+    # 用于在 writer 闭包内传递结果
+    result = {"is_proc": False, "queue_len": 0, "skipped": False}
 
-        # 读取现有队列
-        if qp.exists():
-            try:
-                data = json.loads(qp.read_text(encoding="utf-8"))
-                is_proc = bool(data.get("processing", False))
-            except (json.JSONDecodeError, OSError):
-                data = {"messages": []}
-        else:
-            data = {"messages": []}
-
+    def _do_enqueue(data):
+        result["is_proc"] = bool(data.get("processing", False))
+        msgs = data.setdefault("messages", [])
         # 去重：检查 message_id 是否已存在
-        existing_ids = {m.get("message_id") for m in data["messages"]}
+        existing_ids = {m.get("message_id") for m in msgs}
         if record.get("message_id") in existing_ids:
             log.debug(f"重复消息，跳过: {record.get('message_id')}")
-            return is_proc, len(data["messages"])
-
-        data["messages"].append(record)
+            result["queue_len"] = len(msgs)
+            result["skipped"] = True
+            return  # writer 不修改 data 则不会触发写入... 但实际会写入（无副作用）
+        msgs.append(record)
         data["last_updated"] = now()
-        queue_len = len(data["messages"])
+        result["queue_len"] = len(msgs)
 
-        qp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return is_proc, queue_len
+    with _queue_lock:  # 线程锁 + 文件锁 双重保护
+        _locked_queue_rw(qp, writer=_do_enqueue)
+
+    return result["is_proc"], result["queue_len"]
 
 
 # ── 消息处理器 ───────────────────────────────────────────────────────────────

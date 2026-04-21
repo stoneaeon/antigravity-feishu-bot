@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import json
+import fcntl
 import time
 import signal
 import argparse
@@ -46,6 +47,7 @@ CHAT_MODIFIER = "command down, shift down"
 POLL_INTERVAL = 2              # 队列检查间隔（秒）
 COOLDOWN_SEC  = 30             # 同批次消息最短触发间隔（秒），避免反复激活
 PROCESSING_TIMEOUT = 600       # processing 锁超时时间（秒），超时后视为死锁并重新触发
+PROCESSING_CONFIRM_TIMEOUT = 30  # Agent 启动确认超时（秒），设置锁后 Agent 未读取消息则视为未启动
 POST_PROC_DELAY   = 15         # 处理完毕后等待秒数，让 Antigravity 完全结束本轮对话再触发下一轮
 MAX_CONSECUTIVE_ERRORS = 3     # 连续重试失败上限（3次×10秒），超过后释放锁让用户可通过飞书恢复
 ERROR_BACKOFF_BASE = 10        # 错误重试间隔（秒），固定10秒
@@ -77,6 +79,29 @@ def pid_path(ws: Path) -> Path:
 
 def log_path(ws: Path) -> Path:
     return ws / ".antigravity" / "feishu_watcher.log"
+
+
+def _locked_queue_rw(qp: Path, writer=None):
+    """跨进程安全地读写队列文件。
+
+    使用 fcntl.flock() 实现进程间互斥，防止 listener/watcher/Agent
+    同时读写 JSON 文件导致数据竞态。
+
+    writer=None: 只读，返回 data dict
+    writer=callable: 读取后调用 writer(data)，写回文件，返回 data
+    """
+    qp.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = qp.with_suffix(".lock")
+    with open(lock_file, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = json.loads(qp.read_text(encoding="utf-8")) if qp.exists() else {"messages": []}
+            if writer:
+                writer(data)
+                qp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            return data
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 # ── 显示器休眠检测 ─────────────────────────────────────────────────────────────
@@ -209,21 +234,23 @@ def is_app_running(app_name: str) -> bool:
 
 
 # ── 消息队列读取 ──────────────────────────────────────────────────────────────
-def get_pending_messages(ws: Path) -> tuple[list, bool, float, int]:
+def get_pending_messages(ws: Path) -> tuple[list, bool, float, int, bool]:
     """
-    返回 (messages, is_processing, processing_elapsed_sec, processing_msg_count)。
+    返回 (messages, is_processing, processing_elapsed_sec, processing_msg_count, agent_has_read)。
     is_processing: Agent 是否正在处理队列（processing 锁）
     processing_elapsed_sec: 锁已持续的秒数（未锁定时为 0）
     processing_msg_count: 正在处理中的消息数量（processing_messages 列表长度）
+    agent_has_read: Agent 是否已读取消息（agent_read_at 是否存在）
     """
     qp = queue_path(ws)
     if not qp.exists():
-        return [], False, 0.0, 0
+        return [], False, 0.0, 0, False
     try:
-        data = json.loads(qp.read_text(encoding="utf-8"))
+        data = _locked_queue_rw(qp)
         msgs = data.get("messages", [])
         is_processing = bool(data.get("processing", False))
         proc_msg_count = len(data.get("processing_messages", []))
+        agent_has_read = bool(data.get("agent_read_at"))
         elapsed = 0.0
         if is_processing and data.get("processing_since"):
             try:
@@ -233,24 +260,35 @@ def get_pending_messages(ws: Path) -> tuple[list, bool, float, int]:
                 elapsed = (datetime.datetime.now() - since).total_seconds()
             except (ValueError, TypeError):
                 pass
-        return msgs, is_processing, elapsed, proc_msg_count
+        return msgs, is_processing, elapsed, proc_msg_count, agent_has_read
     except Exception:
-        return [], False, 0.0, 0
+        return [], False, 0.0, 0, False
 
 
-def reset_processing_lock(ws: Path) -> None:
-    """重置 processing 锁（超时后由 watcher 调用，防止死锁）"""
+def reset_processing_lock(ws: Path, restore_messages: bool = False) -> None:
+    """重置 processing 锁（超时后由 watcher 调用，防止死锁）。
+    
+    restore_messages=True 时，将 processing_messages 放回 messages 头部，
+    防止配额切换/连续错误后消息被永远搁置。
+    """
     qp = queue_path(ws)
     if not qp.exists():
         return
     try:
-        data = json.loads(qp.read_text(encoding="utf-8"))
-        data.pop("processing", None)
-        data.pop("processing_since", None)
-        qp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        def _do_reset(data):
+            if restore_messages:
+                proc_msgs = data.pop("processing_messages", [])
+                if proc_msgs:
+                    # 放回 messages 头部，优先处理旧消息
+                    data["messages"] = proc_msgs + data.get("messages", [])
+                    log(f"🔄 已将 {len(proc_msgs)} 条消息回迁到待处理队列")
+            else:
+                data.pop("processing_messages", None)
+            data.pop("processing", None)
+            data.pop("processing_since", None)
+            data.pop("agent_read_at", None)
+
+        _locked_queue_rw(qp, writer=_do_reset)
     except Exception:
         pass
 
@@ -268,13 +306,12 @@ def set_processing_lock(ws: Path) -> None:
     if not qp.exists():
         return
     try:
-        data = json.loads(qp.read_text(encoding="utf-8"))
-        data["processing"] = True
-        data["processing_since"] = now()
-        qp.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        def _do_set(data):
+            data["processing"] = True
+            data["processing_since"] = now()
+            data.pop("agent_read_at", None)  # 清除旧心跳，等待新一轮 Agent 确认
+
+        _locked_queue_rw(qp, writer=_do_set)
     except Exception:
         pass
 
@@ -337,6 +374,8 @@ def activate_and_trigger(app_name: str, text: str) -> bool:
     # 5. 确认已成功聚焦后，粘贴文本并回车提交以触发 Agent 启动
     script_paste = f"""
 tell application "System Events"
+    keystroke "a" using command down
+    delay 0.1
     set the clipboard to "{safe_text}"
     keystroke "v" using command down
     delay 0.2
@@ -543,6 +582,94 @@ def notify_error_via_feishu(ws: Path, error_text: str,
         pass
 
 
+# ── 特权控制指令 ──────────────────────────────────────────────────────────────
+def notify_via_feishu(ws: Path, msg: str) -> None:
+    """发送普通的文本通知（调用 feishu.py send_text）"""
+    feishu_py = Path(__file__).parent / "feishu.py"
+    if not feishu_py.exists():
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, str(feishu_py), "send_text", msg,
+             "--workspace", str(ws)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+def switch_model_ui(app_name: str, target_model: str) -> bool:
+    """仅激活窗口并通过 OCR 切模型"""
+    script_activate = f'tell application "{app_name}" to activate'
+    subprocess.run(["osascript", "-e", script_activate], timeout=5)
+    time.sleep(1.5)
+    
+    # 点击当前模型下拉框
+    __run_vision("click", "claude", "gemini", "gpt", "sonnet", "opus", "high")
+    time.sleep(1.5)
+    
+    # 点击目标模型
+    clicked_out = __run_vision("click", target_model)
+    return "CLICKING at" in clicked_out
+
+def intercept_special_commands(ws: Path, messages: list, app_name: str) -> bool:
+    """拦截特权控制字，返回 True 表示已拦截处理"""
+    if not messages:
+        return False
+        
+    last_msg = messages[-1]
+    text = last_msg.get("text", "").strip()
+    
+    if text in ["#重置", "#打断", "#reset", "强行打断", "清空队列", "重置", "打断"]:
+        log("🔄 收到手工清空/打断指令，执行重置...")
+        def _do_clear_cmd(data):
+            data.pop("processing_messages", None)
+            data.pop("processing", None)
+            data.pop("processing_since", None)
+            data.pop("agent_read_at", None)
+            data["messages"] = [m for m in data.get("messages", []) if m.get("message_id") != last_msg.get("message_id")]
+        
+        _locked_queue_rw(queue_path(ws), writer=_do_clear_cmd)
+        notify_via_feishu(ws, "✅ 已收到干预指令，为您强制清空锁定并且终结原有执行记录。")
+        return True
+        
+    is_switch = False
+    target_model_raw = ""
+    for prefix in ["#切模型", "切模型"]:
+        if text.startswith(prefix):
+            is_switch = True
+            target_model_raw = text[len(prefix):].strip()
+            break
+            
+    if is_switch:
+        # 智能简写映射：防患大模型精确字眼OCR不上的情况
+        tm_lower = target_model_raw.lower()
+        if "gemini" in tm_lower or "3.1" in tm_lower:
+            target_model = "Gemini 3.1 Pro"
+        elif "opus" in tm_lower or "4.6" in tm_lower:
+            target_model = "Claude Opus 4.6"
+        elif "sonnet" in tm_lower or "3.5" in tm_lower:
+            target_model = "Claude 3.5 Sonnet"
+        else:
+            target_model = target_model_raw if target_model_raw else "Claude Opus 4.6"
+            
+        log(f"🔄 收到切模型指令：[{target_model_raw}] -> 将试图映射定位: {target_model}")
+        
+        notify_via_feishu(ws, f"正在为您切换至模型: {target_model}...")
+        ok = switch_model_ui(app_name, target_model)
+        
+        def _do_clear_cmd2(data):
+            data["messages"] = [m for m in data.get("messages", []) if m.get("message_id") != last_msg.get("message_id")]
+        _locked_queue_rw(queue_path(ws), writer=_do_clear_cmd2)
+        
+        if ok:
+            notify_via_feishu(ws, f"✅ 已成功切换至模型: {target_model}")
+        else:
+            notify_via_feishu(ws, f"⚠️ 切换模型失败，未能通过视觉定位到 [{target_model}]")
+        return True
+        
+    return False
+
+
 # ── 主监控循环 ────────────────────────────────────────────────────────────────
 def watch_loop(ws: Path, app_name: str) -> None:
     """
@@ -558,6 +685,7 @@ def watch_loop(ws: Path, app_name: str) -> None:
     error_check_count  = 0       # processing 期间的检测计数器
     consecutive_errors = 0       # 连续错误计数（用于退避和上限判断）
     was_processing     = False   # 上一轮是否在处理中（用于检测处理完毕→新消息的转换）
+    consecutive_trigger_fails = 0 # 连续触发失败计数（用于防锁屏通知刷屏）
 
     log(f"∎ 监控启动 · 工作区: {ws}")
     log(f"  目标应用: {app_name}  |  队列: {queue_path(ws)}")
@@ -565,8 +693,13 @@ def watch_loop(ws: Path, app_name: str) -> None:
 
     while True:
         try:
-            messages, is_processing, proc_elapsed, proc_msg_count = get_pending_messages(ws)
+            messages, is_processing, proc_elapsed, proc_msg_count, agent_has_read = get_pending_messages(ws)
             msg_count = len(messages)
+
+            # ── 特殊指令强制拦截区 ────
+            if msg_count > 0 and intercept_special_commands(ws, messages, app_name):
+                time.sleep(1)
+                continue
 
             # ── Bug 2 修复：跳过仅含 pending_instruction 的图片消息 ────
             # 如果所有消息都是 pending_instruction=true（图片等待后续文字指令），
@@ -582,7 +715,27 @@ def watch_loop(ws: Path, app_name: str) -> None:
 
             # ── Agent 正在处理中（processing 锁）──────────────────────
             if is_processing:
-                if proc_elapsed < PROCESSING_TIMEOUT:
+                was_processing = True  # 跟踪处理状态，用于检测 完毕→新消息 的自动触发
+
+                # ── Agent 启动确认检查 ──────────────────────────────────
+                # processing 锁设置后，若 Agent 始终未读取消息（agent_read_at 不存在），
+                # 超过确认超时则判定 Agent 未启动
+                # 常见原因：会话不活跃、模型切换间隙、Agent 在处理其他任务
+                if (proc_elapsed > PROCESSING_CONFIRM_TIMEOUT
+                        and not agent_has_read
+                        and (msg_count > 0 or proc_msg_count > 0)):
+                    log(f"⚠️  processing 锁已 {proc_elapsed:.0f}s，但 Agent 未读取消息（无 agent_read_at）")
+                    log(f"   疑似 Agent 未启动（会话不活跃/模型切换），重置锁并重新触发")
+                    reset_processing_lock(ws, restore_messages=True)
+                    error_check_count = 0
+                    was_processing = False
+                    last_trigger_ts = 0.0  # 重置冷却，允许立即重新触发
+                    send_notification(
+                        title="🔄 自动重新触发",
+                        body=f"Agent 未响应，重新激活处理（{msg_count + proc_msg_count} 条消息）"
+                    )
+                    # 不 continue，落入下方触发逻辑
+                elif proc_elapsed < PROCESSING_TIMEOUT:
                     # 锁未超时 → Agent 仍在处理
                     # 每隔 5 个轮询周期（约 10 秒）检测一次 UI 异常
                     error_check_count += 1
@@ -602,15 +755,14 @@ def watch_loop(ws: Path, app_name: str) -> None:
                                     log("  ✅ 已自动切换备用模型")
                                     auto_handled = True
                                     consecutive_errors = 0
-                                    # 不重新注入trigger（会堆积在Pending messages）
-                                    # 释放锁，飞书通知用户重新发消息
-                                    reset_processing_lock(ws)
+                                    # 释放锁并回迁消息，防止消息被搁置在 processing_messages
+                                    reset_processing_lock(ws, restore_messages=True)
                                     notify_error_via_feishu(
                                         ws, error_text, auto_handled=True,
                                         retry_count=consecutive_errors,
                                         lock_released=True,
                                     )
-                                    log("  📨 已通知用户模型已切换，请重新发消息")
+                                    log("  📨 已通知用户模型已切换，消息已回迁待重新处理")
                                     continue
                                 else:
                                     log("  ⚠️  自动切换模型失败")
@@ -628,12 +780,12 @@ def watch_loop(ws: Path, app_name: str) -> None:
                                     log("  ⚠️  未能关闭弹窗")
                             
                             # ── 连续错误超限：释放 processing 锁 ──────────
-                            # 非模型配额类错误连续多次失败后，释放锁，
+                            # 非模型配额类错误连续多次失败后，释放锁并回迁消息，
                             # 让用户可以通过飞书发消息来恢复操作
                             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS and not is_quota:
                                 log(f"⚠️  连续 {consecutive_errors} 次异常，释放 processing 锁")
                                 log(f"  🔓 用户可通过飞书发送消息来恢复操作")
-                                reset_processing_lock(ws)
+                                reset_processing_lock(ws, restore_messages=True)
                                 consecutive_errors = 0
                                 # 立即发飞书通知，告知用户锁已释放
                                 notify_error_via_feishu(
@@ -670,8 +822,9 @@ def watch_loop(ws: Path, app_name: str) -> None:
                 else:
                     # 锁已超时（超过 10 分钟）→ 疑似死锁，重置并重新触发
                     log(f"⚠️  processing 锁已超时（{proc_elapsed:.0f}s），重置并重新触发")
-                    reset_processing_lock(ws)
+                    reset_processing_lock(ws, restore_messages=True)
                     error_check_count = 0
+                    was_processing = False  # 修复漏洞3：超时重置时同步清除 was_processing
                     # 不 continue，落入下方触发逻辑
 
             # ── 队列为空判定 ─────────────────────────────────────────────
@@ -685,6 +838,7 @@ def watch_loop(ws: Path, app_name: str) -> None:
                     log("✅ 队列已清空，所有任务处理完毕")
                 last_msg_count  = 0
                 last_trigger_ts = 0.0
+                was_processing  = False
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -695,14 +849,22 @@ def watch_loop(ws: Path, app_name: str) -> None:
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # ── 处理刚完毕，有新消息待处理 → 等待 Antigravity 完全结束对话 ─
-            # Agent 刚完成上一轮任务，Antigravity UI 可能还没准备好接收新输入
-            # 如果立刻触发，文本会堆到 Pending messages 而不是被提交
+            # ── 处理刚完毕，有新消息待处理 → 等待后自动触发下一轮 ───
+            # Agent 刚完成上一轮任务，等待 UI 就绪后直接触发（跳过冷却期）
             if was_processing and msg_count > 0:
-                log(f"⏳ 上轮处理刚完毕，等待 {POST_PROC_DELAY}s 再触发下一轮（{msg_count} 条待处理）")
+                log(f"🔄 上轮处理刚完成，检测到 {msg_count} 条新消息待处理")
+                log(f"⏳ 等待 {POST_PROC_DELAY}s 让 Antigravity 就绪...")
                 was_processing = False
                 time.sleep(POST_PROC_DELAY)
-                continue  # 重新进入循环检查最新状态
+                # 重新检查队列状态（等待期间可能已被其他方式处理）
+                messages, is_processing, _, _, _ = get_pending_messages(ws)
+                msg_count = len(messages)
+                if msg_count == 0 or is_processing:
+                    log("   → 等待期间队列已清空或新 processing 锁已设置，跳过本轮")
+                    continue
+                last_trigger_ts = 0.0  # 重置冷却期，跳过下方冷却检查
+                log(f"   → 自动触发下一轮处理（{msg_count} 条待处理）")
+                # 不 continue，直接落入下方触发逻辑
 
             # ── 冷却期与防重检查 ───────────────────────────────────────
             elapsed = time.time() - last_trigger_ts
@@ -760,14 +922,36 @@ def watch_loop(ws: Path, app_name: str) -> None:
 
             if ok:
                 set_processing_lock(ws)
+                consecutive_trigger_fails = 0
                 log(f"✅ 已激活并设置 processing 锁，Agent 处理完毕前不会重复触发")
             else:
-                log(f"⚠️  自动触发失败，已发送通知，请手动切换到 {app_name}")
+                consecutive_trigger_fails += 1
+                log(f"⚠️  自动触发失败 [{consecutive_trigger_fails}]，请手动切换到 {app_name}")
+                # UX体验优化：通知退避机制，防止锁屏无限发飞书刷屏
+                if consecutive_trigger_fails == 1 or consecutive_trigger_fails % 10 == 0:
+                    notify_error_via_feishu(
+                        ws, f"AppleScript/OCR 触发失败 (第 {consecutive_trigger_fails} 次)，Chat 框未定位",
+                        auto_handled=False, lock_released=True,
+                    )
+                    send_notification(
+                        title="⚠️ 飞书任务触发失败",
+                        body=f"{msg_count} 条消息待处理，请检查屏幕是否锁定"
+                    )
+                else:
+                    log(f"   已进入崩溃通知静默期，暂不向飞书推送过载报警")
 
             last_trigger_ts = time.time()
 
         except Exception as e:
             log(f"监控循环异常: {e}")
+            # 修复漏洞5：外层异常发飞书通知，避免故障静默
+            try:
+                notify_error_via_feishu(
+                    ws, f"Watcher 循环异常: {e}",
+                    auto_handled=False, lock_released=False,
+                )
+            except Exception:
+                pass  # 通知失败不能让 watcher 崩溃
 
         time.sleep(POLL_INTERVAL)
 
