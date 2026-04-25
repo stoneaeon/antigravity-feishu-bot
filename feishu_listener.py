@@ -202,8 +202,11 @@ def enqueue_message(ws: Path, record: dict) -> tuple[bool, int]:
     def _do_enqueue(data):
         result["is_proc"] = bool(data.get("processing", False))
         msgs = data.setdefault("messages", [])
+        proc_msgs = data.setdefault("processing_messages", [])
         # 去重：检查 message_id 是否已存在
         existing_ids = {m.get("message_id") for m in msgs}
+        # 连同正在处理的消息池一起检查，坚决防止重复收录！
+        existing_ids.update({m.get("message_id") for m in proc_msgs})
         if record.get("message_id") in existing_ids:
             log.debug(f"重复消息，跳过: {record.get('message_id')}")
             result["queue_len"] = len(msgs)

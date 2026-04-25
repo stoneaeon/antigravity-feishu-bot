@@ -47,7 +47,7 @@ CHAT_MODIFIER = "command down, shift down"
 POLL_INTERVAL = 2              # 队列检查间隔（秒）
 COOLDOWN_SEC  = 30             # 同批次消息最短触发间隔（秒），避免反复激活
 PROCESSING_TIMEOUT = 600       # processing 锁超时时间（秒），超时后视为死锁并重新触发
-PROCESSING_CONFIRM_TIMEOUT = 30  # Agent 启动确认超时（秒），设置锁后 Agent 未读取消息则视为未启动
+PROCESSING_CONFIRM_TIMEOUT = 120  # Agent 启动确认超时（秒），设置锁后 Agent 未读取消息则视为未启动
 POST_PROC_DELAY   = 15         # 处理完毕后等待秒数，让 Antigravity 完全结束本轮对话再触发下一轮
 MAX_CONSECUTIVE_ERRORS = 3     # 连续重试失败上限（3次×10秒），超过后释放锁让用户可通过飞书恢复
 ERROR_BACKOFF_BASE = 10        # 错误重试间隔（秒），固定10秒
@@ -741,6 +741,16 @@ def watch_loop(ws: Path, app_name: str) -> None:
                     error_check_count += 1
                     if error_check_count % 5 == 0 and is_app_running(app_name):
                         error_text, buttons_str = detect_app_error(app_name)
+
+                        # 自动检测并接受代码变更
+                        if "accept all" in buttons_str:
+                            log("💡 检测到 Accept all 按钮，正在自动点击接受全部变更...")
+                            out_click = __run_vision("click", "Accept all")
+                            if "CLICKING at" in out_click:
+                                log("  ✅ 已成功自动接受变更")
+                            else:
+                                log("  ⚠️  试图点击 Accept all 但视觉定位未成功")
+
                         if error_text:
                             consecutive_errors += 1
                             error_category = _classify_error(error_text)
